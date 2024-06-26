@@ -15,12 +15,12 @@
 
 ### Polygonal Hair Strands
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/2ab9b969-9dcc-4a19-b85d-e24681f837c9)
+  <div align=center><img width="600" height="450" src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/2ab9b969-9dcc-4a19-b85d-e24681f837c9"/></div>
   
   Generate a Set of Hair Textures Using the Hair-Strand-Designer Tool
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/d8a4e8c2-11e1-426e-ad2f-67fde814bfac)
-
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/d8a4e8c2-11e1-426e-ad2f-67fde814bfac"/></div>
+  
   Modeling Faceted Hair with Maya Modeling Tools
 
 ### Strand-Based Fine Hair Solutions
@@ -33,23 +33,23 @@
 
   In 2017, AMD's OpenGPU introduced an export plugin for TressFX hair systems, enabling the export of Xgen hair to a usable format. However, post-2018 versions of Maya saw changes in the Python API, necessitating adjustments to the plugin to accommodate changes in the Pymel system. Additionally, the original export plugin required three separate operations to export tfxbone skeleton files, tfx hair files, and tfxskin collision skinned mesh files. The tfx hair files and tfxskin collision skinned mesh files must be placed in the same directory to bind the hair root nodes to the scalp skin, confirming the distribution of hair clusters. This research consolidates all data into a JSON file using Python and JSON, which is then parsed into tfx hair files and tfxskin collision skinned mesh files upon import into Unreal Engine, where the same binding operations are performed.
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/045da08a-7109-4b5e-8f53-6c32354a82c2)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/045da08a-7109-4b5e-8f53-6c32354a82c2"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/0322a6f4-5b29-4fda-aefa-372622df6cf6)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/0322a6f4-5b29-4fda-aefa-372622df6cf6"/></div>
 
 ## Research and Improvement of Semi-Transparent Rendering Algorithms for Fine Hair
 
 ### Order-Dependent Semi-Transparent Rendering Algorithm for Fine Hair
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/320c2b85-975c-4fb0-a3c9-792c04a2c4fa)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/320c2b85-975c-4fb0-a3c9-792c04a2c4fa"/></div>
 
   Alpha Blending Effect in Unreal Engine
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/449b5e41-0149-4bfc-acb6-bf6256600d45)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/449b5e41-0149-4bfc-acb6-bf6256600d45"/></div>
 
   Alpha Test Effect in Unreal Engine
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/3ffe92bf-241d-4d90-abca-ae47c3acf896)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/3ffe92bf-241d-4d90-abca-ae47c3acf896"/></div>
 
 ### Order-Independent Semi-Transparent Rendering Algorithm for Fine Hair
 
@@ -63,11 +63,11 @@
 
   Weighted Blended Order-Independent Transparency
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/08f07d7f-af8b-45d4-a410-97ee18e42647)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/08f07d7f-af8b-45d4-a410-97ee18e42647"/></div>
 
   Moment Based Order-Independent Transparency
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/d35569d1-250d-41fd-88ea-9036206752d5)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/d35569d1-250d-41fd-88ea-9036206752d5"/></div>
 
 
 ## Research and Improvement of Fine Hair Lighting Models
@@ -75,44 +75,44 @@
 ### Anisotropic Hair-based Kajiya-Kay Lighting Model
 
   Blinn-Phong Model
-  
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/2152780d-6013-45cc-9a4c-b960e42e993f)
+
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/2152780d-6013-45cc-9a4c-b960e42e993f"/></div>
 
   Kajiya-Kay Model
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/38aeb54a-be98-4b83-b3cc-a303c04752c7)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/38aeb54a-be98-4b83-b3cc-a303c04752c7"/></div>
 
   Marschner Model
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/3aafabd1-7616-4560-aa54-e08714537f14)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/3aafabd1-7616-4560-aa54-e08714537f14"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/949fd7f3-2810-468c-9b91-d64b6ef12325)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/949fd7f3-2810-468c-9b91-d64b6ef12325"/></div>
 
 ### Practical Design of Enhanced Fine Hair Systems in Virtual Reality Digital MetaHumans
 
   Procedurally Generated Head Models Based on Real Human Facial Photographs
-  
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/43cd7ed5-e539-4183-8579-249281aed51e)
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/a43994b4-8f66-4092-a099-299d993328c5)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/43cd7ed5-e539-4183-8579-249281aed51e"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/c137d131-6abe-4dec-8d7b-c5847b2c194f)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/a43994b4-8f66-4092-a099-299d993328c5"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/547b8f8d-48c6-41f0-bd1a-697f4ac08d32)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/c137d131-6abe-4dec-8d7b-c5847b2c194f"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/df8a6312-2c6a-4243-a4e5-341fae1f61ab)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/547b8f8d-48c6-41f0-bd1a-697f4ac08d32"/></div>
+
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/df8a6312-2c6a-4243-a4e5-341fae1f61ab"/></div>
 
 ### Guide-Based Fine Hair System for Virtual Digital Humans
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/471066b1-2949-482d-b852-e940b70ed831)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/471066b1-2949-482d-b852-e940b70ed831"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/6766214c-720d-4eec-85a4-8f5958e4a594)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/6766214c-720d-4eec-85a4-8f5958e4a594"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/3721d21d-b36c-4ac9-af25-1f1d9c02081e)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/3721d21d-b36c-4ac9-af25-1f1d9c02081e"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/09a2d534-e30b-4f69-a5e9-5fad62599863)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/09a2d534-e30b-4f69-a5e9-5fad62599863"/></div>
 
-  ![image](https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/37784e1f-fdb5-41cc-88b4-6012b38f0aa8)
+  <div align=center><img src="https://github.com/Arcadia-Liu/Optimization-of-Real-time-Fine-Hair-Simulation-and-Rendering/assets/126369162/37784e1f-fdb5-41cc-88b4-6012b38f0aa8"/></div>
 
 
 
