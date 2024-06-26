@@ -1,0 +1,244 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "../Common.ush"
+#include "TressFXSimulationCommon.ush"
+
+
+float3 VelocityShockPropagation;
+
+#define VSPAccelThresholdMax VelocityShockPropagation.y
+#define VSPAccelThresholdMin VelocityShockPropagation.z
+
+
+Buffer<float4> GuidesDeformedPositionBuffer; 
+Buffer<float4> GuidesDeformedPrevPositionBuffer;
+Buffer<float4> GuidesDeformedPrevPrevPositionBuffer;
+
+RWStructuredBuffer<FStrandLevelData> GuidesDeformedStrandLevelDataBuffer;
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CalculateStrandLevelData(uint GIndex : SV_GroupIndex,
+	                          uint3 GId : SV_GroupID,
+	                          uint3 DTid : SV_DispatchThreadID)
+{
+	uint GlobalStrandIndex, NumVerticesInTheStrand, GlobalRootVertexIndex, StrandType;
+	CalcIndicesInStrandLevelMaster(GIndex, GId.x, GlobalStrandIndex, NumVerticesInTheStrand, GlobalRootVertexIndex, StrandType);
+
+    float4 pos_old_old[2]; // previous previous positions for vertex 0 (root) and vertex 1.
+	float4 pos_old[2]; // previous positions for vertex 0 (root) and vertex 1.
+	float4 pos_new[2]; // current positions for vertex 0 (root) and vertex 1.
+
+    pos_old_old[0] = GuidesDeformedPrevPrevPositionBuffer[GlobalRootVertexIndex];
+    pos_old_old[1] = GuidesDeformedPrevPrevPositionBuffer[GlobalRootVertexIndex + 1];
+
+    pos_old[0] = GuidesDeformedPrevPositionBuffer[GlobalRootVertexIndex];
+	pos_old[1] = GuidesDeformedPrevPositionBuffer[GlobalRootVertexIndex + 1];
+	
+    pos_new[0] = GuidesDeformedPositionBuffer[GlobalRootVertexIndex];
+	pos_new[1] = GuidesDeformedPositionBuffer[GlobalRootVertexIndex + 1];
+
+	float3 u = normalize(pos_old[1].xyz - pos_old[0].xyz);
+	float3 v = normalize(pos_new[1].xyz - pos_new[0].xyz);
+	
+    // Compute rotation and translation which transform pos_old to pos_new. 
+    // Since the first two vertices are immovable, we can assume that there is no scaling during tranform. 
+	float4 rot = QuatFromTwoUnitVectors(u, v);
+	float3 trans = pos_new[0].xyz - MultQuaternionAndVector(rot, pos_old[0].xyz);
+
+	float VspCoeff = VelocityShockPropagation.x;
+	
+	// Increate the VSP coefficient by checking pseudo-acceleration to handle over-stretching when the character moves very fast 
+    float Accel = length(pos_new[1] - 2.0 * pos_old[1] + pos_old_old[1]);
+
+    if (Accel > VSPAccelThresholdMax) // TODO: expose this value?
+        VspCoeff = 1.0f;
+	
+	if(Accel < VSPAccelThresholdMin)
+		VspCoeff = 0.6f;
+
+	GuidesDeformedStrandLevelDataBuffer[GlobalStrandIndex].VspQuat = rot;
+	GuidesDeformedStrandLevelDataBuffer[GlobalStrandIndex].VspTranslation = float4( trans, VspCoeff );
+
+    float4 InitialPos = float4(0,0,0,0); // rest position
+
+	FBoneIndexData IndexData = GuidesBoneIndexBuffer[GlobalStrandIndex];
+    float4 bone_quat;
+    ApplyVertexBoneSkinning(InitialPos.xyz, IndexData, bone_quat);
+	GuidesDeformedStrandLevelDataBuffer[GlobalStrandIndex].SkinningQuat = bone_quat;
+
+}
+
+
+
+struct FMTMeshTriangle
+{
+	float3 P0;
+	float3 P1;
+	float3 P2;
+
+	float3 E0;
+	float3 E1;
+
+	float3 N;
+};
+
+void ToTriangleLocal(float3 B, const FMTMeshTriangle T, inout float4x4 ToLocalMatrix)
+{
+
+	float4x4 Rot = float4x4(
+					float4(T.E0.x,T.E1.x,T.N.x,0),
+					float4(T.E0.y,T.E1.y,T.N.y,0),
+					float4(T.E0.z,T.E1.z,T.N.z,0),
+					float4(0,0,0,1));
+
+	ToLocalMatrix = Rot;
+	
+}
+
+void ToTriangleWorld(float3 B, const FMTMeshTriangle T,inout float4x4 ToWorldMatrix)
+{
+	ToWorldMatrix = float4x4(
+						float4(T.E0,0),
+						float4(T.E1,0),
+						float4(T.N,0),
+						float4(0,0,0,1));
+
+}
+
+float4x4 CompToWorld;
+
+Buffer<float> MeshPositionRestBuffer;
+Buffer<float> MeshPositionDeformedBuffer;
+
+
+struct FGuideRootTriangle 
+{
+	float2 TriBarycentrices;
+	uint Vertex0Index;
+	uint Vertex1Index;
+    uint Vertex2Index;
+};
+StructuredBuffer<FGuideRootTriangle> GuidesRootBindingTrianglesBuffer;
+StructuredBuffer<uint> GuidesLocalToGlobalVertexIndexMapBuffer;
+
+void ApplyBlendShapeSkinning(uint GlobalStrandIndex, inout float4 BoneQuat)
+{
+    FGuideRootTriangle Info = GuidesRootBindingTrianglesBuffer[GlobalStrandIndex];
+
+    float3 Bary = float3(Info.TriBarycentrices.xy,1 - Info.TriBarycentrices.x - Info.TriBarycentrices.y);
+
+    // Get the Rest RootTriangle pos
+	uint Vertex0GlobalIndex = GuidesLocalToGlobalVertexIndexMapBuffer[Info.Vertex0Index]*3;
+	uint Vertex1GlobalIndex = GuidesLocalToGlobalVertexIndexMapBuffer[Info.Vertex1Index]*3;
+	uint Vertex2GlobalIndex = GuidesLocalToGlobalVertexIndexMapBuffer[Info.Vertex2Index]*3;
+	FMTMeshTriangle RestTriangle;
+	RestTriangle.P0 = float3(MeshPositionRestBuffer[Vertex0GlobalIndex],MeshPositionRestBuffer[Vertex0GlobalIndex+1],MeshPositionRestBuffer[Vertex0GlobalIndex+2]);
+	RestTriangle.P1 = float3(MeshPositionRestBuffer[Vertex1GlobalIndex],MeshPositionRestBuffer[Vertex1GlobalIndex+1],MeshPositionRestBuffer[Vertex1GlobalIndex+2]);
+	RestTriangle.P2 = float3(MeshPositionRestBuffer[Vertex2GlobalIndex],MeshPositionRestBuffer[Vertex2GlobalIndex+1],MeshPositionRestBuffer[Vertex2GlobalIndex+2]);
+	
+    // Gen the transform from guide vertex Model Space to RootTriangle Local Space
+	RestTriangle.E0 = RestTriangle.P1 - RestTriangle.P0;
+	RestTriangle.E1 = RestTriangle.P2 - RestTriangle.P0;
+	RestTriangle.N = normalize(cross(RestTriangle.E1, RestTriangle.E0));
+	RestTriangle.E0 = normalize(RestTriangle.E0);
+	RestTriangle.E1 = normalize(cross(RestTriangle.E0, RestTriangle.N));
+	
+	float4x4 ToLocalMatrix;
+	ToTriangleLocal(Bary,RestTriangle,ToLocalMatrix);
+
+    // Get the Deformed RootTriangle pos
+	uint Vertex0LocalIndex = 3*Info.Vertex0Index;
+	uint Vertex1LocalIndex = 3*Info.Vertex1Index;
+	uint Vertex2LocalIndex = 3*Info.Vertex2Index;
+	FMTMeshTriangle DeformedTriangle;
+	DeformedTriangle.P0 = float3(MeshPositionDeformedBuffer[Vertex0LocalIndex],MeshPositionDeformedBuffer[Vertex0LocalIndex+1],MeshPositionDeformedBuffer[Vertex0LocalIndex+2]);
+	DeformedTriangle.P1 = float3(MeshPositionDeformedBuffer[Vertex1LocalIndex],MeshPositionDeformedBuffer[Vertex1LocalIndex+1],MeshPositionDeformedBuffer[Vertex1LocalIndex+2]);
+	DeformedTriangle.P2 = float3(MeshPositionDeformedBuffer[Vertex2LocalIndex],MeshPositionDeformedBuffer[Vertex2LocalIndex+1],MeshPositionDeformedBuffer[Vertex2LocalIndex+2]);
+
+    // Gen the transform from RootTriangle Local Space to World Space
+	DeformedTriangle.E0 = DeformedTriangle.P1 - DeformedTriangle.P0;
+	DeformedTriangle.E1 = DeformedTriangle.P2 - DeformedTriangle.P0;
+	DeformedTriangle.N = normalize(cross(DeformedTriangle.E1, DeformedTriangle.E0));
+	DeformedTriangle.E0 = normalize(DeformedTriangle.E0);
+	DeformedTriangle.E1 = normalize(cross(DeformedTriangle.E0, DeformedTriangle.N));
+	
+    // transform vertex pos from guide vertex Model Space to World Space
+	float4x4 ToWorldMatrix;
+	ToTriangleWorld(Bary,DeformedTriangle,ToWorldMatrix);
+	
+	float4x4 AccumMatrix = mul(mul(ToLocalMatrix,ToWorldMatrix),CompToWorld);
+
+	BoneQuat = NormalizeQuaternion(MakeQuaternion(AccumMatrix));
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CalculateStrandLevelDataMT(uint GIndex : SV_GroupIndex,
+	                          uint3 GId : SV_GroupID,
+	                          uint3 DTid : SV_DispatchThreadID)
+{
+	uint GlobalStrandIndex, NumVerticesInTheStrand, GlobalRootVertexIndex, StrandType;
+	CalcIndicesInStrandLevelMaster(GIndex, GId.x, GlobalStrandIndex, NumVerticesInTheStrand, GlobalRootVertexIndex, StrandType);
+
+    float4 pos_old_old[2]; // previous previous positions for vertex 0 (root) and vertex 1.
+	float4 pos_old[2]; // previous positions for vertex 0 (root) and vertex 1.
+	float4 pos_new[2]; // current positions for vertex 0 (root) and vertex 1.
+
+    pos_old_old[0] = GuidesDeformedPrevPrevPositionBuffer[GlobalRootVertexIndex];
+    pos_old_old[1] = GuidesDeformedPrevPrevPositionBuffer[GlobalRootVertexIndex + 1];
+
+    pos_old[0] = GuidesDeformedPrevPositionBuffer[GlobalRootVertexIndex];
+	pos_old[1] = GuidesDeformedPrevPositionBuffer[GlobalRootVertexIndex + 1];
+	
+    pos_new[0] = GuidesDeformedPositionBuffer[GlobalRootVertexIndex];
+	pos_new[1] = GuidesDeformedPositionBuffer[GlobalRootVertexIndex + 1];
+
+	float3 u = normalize(pos_old[1].xyz - pos_old[0].xyz);
+	float3 v = normalize(pos_new[1].xyz - pos_new[0].xyz);
+	
+    // Compute rotation and translation which transform pos_old to pos_new. 
+    // Since the first two vertices are immovable, we can assume that there is no scaling during tranform. 
+	float4 rot = QuatFromTwoUnitVectors(u, v);
+	float3 trans = pos_new[0].xyz - MultQuaternionAndVector(rot, pos_old[0].xyz);
+
+	float VspCoeff = VelocityShockPropagation.x;
+	
+	// Increate the VSP coefficient by checking pseudo-acceleration to handle over-stretching when the character moves very fast 
+    float Accel = length(pos_new[1] - 2.0 * pos_old[1] + pos_old_old[1]);
+
+    if (Accel > VSPAccelThresholdMax) // TODO: expose this value?
+        VspCoeff = 1.0f;
+	
+	if(Accel < VSPAccelThresholdMin)
+		VspCoeff = 0.6f;
+
+	GuidesDeformedStrandLevelDataBuffer[GlobalStrandIndex].VspQuat = rot;
+	GuidesDeformedStrandLevelDataBuffer[GlobalStrandIndex].VspTranslation = float4( trans, VspCoeff );
+	
+
+    float4 BoneQuat;
+	ApplyBlendShapeSkinning(GlobalStrandIndex, BoneQuat);
+	GuidesDeformedStrandLevelDataBuffer[GlobalStrandIndex].SkinningQuat = BoneQuat;
+
+}

@@ -1,0 +1,255 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#pragma once
+
+#ifndef THREAD_GROUP_SIZE
+#define THREAD_GROUP_SIZE 64
+#endif
+
+uint NumOfStrandsPerThreadGroup;
+
+
+struct FBoneSkinningData
+{
+	uint BoneIndex;  
+	float BoneWeight; 
+};
+
+struct FBoneIndexData
+{
+	uint StartIndex;  
+	uint Count; 
+};
+
+struct FStrandLevelData
+{
+	float4 SkinningQuat;
+	float4 VspQuat;
+	float4 VspTranslation;
+};
+
+
+StructuredBuffer<FBoneSkinningData> GuidesBoneSkinningBuffer;
+StructuredBuffer<FBoneIndexData> GuidesBoneIndexBuffer;
+StructuredBuffer<float4> BoneMatricesBuffer;
+
+void CalcIndicesInVertexLevelMaster(uint Local_Id, uint Group_Id, inout uint GlobalStrandIndex, inout uint LocalStrandIndex, inout uint GlobalVertexIndex, inout uint LocalVertexIndex, inout uint NumVerticesInTheStrand, inout uint IndexForSharedMem, inout uint StrandType)
+{
+    IndexForSharedMem = Local_Id;
+    NumVerticesInTheStrand = uint(THREAD_GROUP_SIZE) / NumOfStrandsPerThreadGroup;
+
+    LocalStrandIndex = Local_Id % NumOfStrandsPerThreadGroup;
+    GlobalStrandIndex = Group_Id * NumOfStrandsPerThreadGroup + LocalStrandIndex;
+//  GlobalStrandIndex *= (NumFollowHairsPerGuideHair+1);
+    LocalVertexIndex = (Local_Id - LocalStrandIndex) / NumOfStrandsPerThreadGroup;
+
+    StrandType = 0;//GetStrandType(GlobalStrandIndex);
+    GlobalVertexIndex = GlobalStrandIndex * NumVerticesInTheStrand + LocalVertexIndex;
+}
+
+void CalcIndicesInStrandLevelMaster(uint Local_Id, uint Group_Id, inout uint GlobalStrandIndex, inout uint NumVerticesInTheStrand, inout uint GlobalRootVertexIndex, inout uint StrandType)
+{
+    GlobalStrandIndex = THREAD_GROUP_SIZE*Group_Id + Local_Id;
+//    GlobalStrandIndex *= (NumFollowHairsPerGuideHair+1);
+    NumVerticesInTheStrand = (THREAD_GROUP_SIZE / NumOfStrandsPerThreadGroup);
+    StrandType = 0;//GetStrandType(GlobalStrandIndex);
+    GlobalRootVertexIndex = GlobalStrandIndex * NumVerticesInTheStrand;
+}
+
+bool IsMovable(uint W)
+{
+	if(W & 0x4)
+		return true;
+
+	return false;
+}
+
+float4 MakeQuaternion(float angle_radian, float3 axis)
+{
+    // create quaternion using angle and rotation axis
+    float4 quaternion;
+    float halfAngle = 0.5f * angle_radian;
+    float sinHalf = sin(halfAngle);
+
+    quaternion.w = cos(halfAngle);
+    quaternion.xyz = sinHalf * axis.xyz;
+
+    return quaternion;
+}
+
+// Makes a quaternion from a 4x4 column major rigid transform matrix. Rigid transform means that rotational 3x3 sub matrix is orthonormal. 
+// Note that this function does not check the orthonormality. 
+float4 MakeQuaternion(column_major float4x4 m)
+{
+	float4 q;
+	float trace = m[0][0] + m[1][1] + m[2][2];
+
+	if (trace > 0.0f)
+	{
+		float r = sqrt(trace + 1.0f);
+		q.w = 0.5 * r;
+		r = 0.5 / r;
+		q.x = (m[1][2] - m[2][1])*r;
+		q.y = (m[2][0] - m[0][2])*r;
+		q.z = (m[0][1] - m[1][0])*r;
+	}
+	else
+	{
+		int i = 0, j = 1, k = 2;
+
+		if (m[1][1] > m[0][0])
+		{
+			i = 1; j = 2; k = 0;
+		}
+		if (m[2][2] > m[i][i])
+		{
+			i = 2; j = 0; k = 1;
+		}
+
+		float r = sqrt(m[i][i] - m[j][j] - m[k][k] + 1.0f);
+
+		float qq[4];
+
+		qq[i] = 0.5f * r;
+		r = 0.5f / r;
+		q.w = (m[j][k] - m[k][j])*r;
+		qq[j] = (m[j][i] + m[i][j])*r;
+		qq[k] = (m[k][i] + m[i][k])*r;
+
+		q.x = qq[0]; q.y = qq[1]; q.z = qq[2];
+	}
+
+	return q;
+}
+
+float4 InverseQuaternion(float4 q)
+{
+    float lengthSqr = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+
+    if ( lengthSqr < 0.001 )
+        return float4(0, 0, 0, 1.0f);
+
+    q.x = -q.x / lengthSqr;
+    q.y = -q.y / lengthSqr;
+    q.z = -q.z / lengthSqr;
+    q.w = q.w / lengthSqr;
+
+    return q;
+}
+
+float3 MultQuaternionAndVector(float4 q, float3 v)
+{
+    float3 uv, uuv;
+    float3 qvec = float3(q.x, q.y, q.z);
+    uv = cross(qvec, v);
+    uuv = cross(qvec, uv);
+    uv *= (2.0f * q.w);
+    uuv *= 2.0f;
+
+    return v + uv + uuv;
+}
+
+float4 MultQuaternionAndQuaternion(float4 qA, float4 qB)
+{
+    float4 q;
+
+    q.w = qA.w * qB.w - qA.x * qB.x - qA.y * qB.y - qA.z * qB.z;
+    q.x = qA.w * qB.x + qA.x * qB.w + qA.y * qB.z - qA.z * qB.y;
+    q.y = qA.w * qB.y + qA.y * qB.w + qA.z * qB.x - qA.x * qB.z;
+    q.z = qA.w * qB.z + qA.z * qB.w + qA.x * qB.y - qA.y * qB.x;
+
+    return q;
+}
+
+float4 NormalizeQuaternion(float4 q)
+{
+	float4 qq = q;
+	float n = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+
+	if (n < 1e-10f)
+	{
+		qq.w = 1;
+		return qq;
+	}
+
+	qq *= 1.0f / sqrt(n);
+	return qq;
+}
+
+
+float3 ApplyVertexBoneSkinning(float3 VertexPos, FBoneIndexData IndexData, inout float4 BoneQuat)
+{
+    float3 NewVertexPos;
+	{
+        // Interpolate world space bone matrices using weights. 
+		FBoneSkinningData BoneSkinningData = GuidesBoneSkinningBuffer[IndexData.StartIndex];
+		float4 A = BoneMatricesBuffer[4*BoneSkinningData.BoneIndex];
+		float4 B = BoneMatricesBuffer[4*BoneSkinningData.BoneIndex+1];
+		float4 C = BoneMatricesBuffer[4*BoneSkinningData.BoneIndex+2];
+		float4 D = BoneMatricesBuffer[4*BoneSkinningData.BoneIndex+3];
+        float4x4 BoneMatrix = float4x4(A,B,C,D) * BoneSkinningData.BoneWeight;
+        float WeightSum = BoneSkinningData.BoneWeight;
+
+        for (int i = 1; i < IndexData.Count; i++)
+        {
+			BoneSkinningData = GuidesBoneSkinningBuffer[IndexData.StartIndex+i];
+            if (BoneSkinningData.BoneWeight > 0)
+            {
+				A = BoneMatricesBuffer[4*BoneSkinningData.BoneIndex];
+				B = BoneMatricesBuffer[4*BoneSkinningData.BoneIndex+1];
+				C = BoneMatricesBuffer[4*BoneSkinningData.BoneIndex+2];
+				D = BoneMatricesBuffer[4*BoneSkinningData.BoneIndex+3];
+                BoneMatrix += float4x4(A,B,C,D) * BoneSkinningData.BoneWeight;
+                WeightSum += BoneSkinningData.BoneWeight;
+            }
+        }
+
+        BoneMatrix /= WeightSum;
+		BoneQuat = NormalizeQuaternion(MakeQuaternion(BoneMatrix));
+        NewVertexPos = mul(float4(VertexPos, 1),BoneMatrix).xyz;
+    }
+
+    return NewVertexPos;
+}
+
+// Compute a quaternion which rotates u to v. u and v must be unit vector. 
+float4 QuatFromTwoUnitVectors(float3 u, float3 v)
+{
+	float r = 1.f + dot(u, v);
+	float3 n;
+
+	// if u and v are parallel
+	if (r < 1e-7)
+	{
+		r = 0.0f;
+		n = abs(u.x) > abs(u.z) ? float3(-u.y, u.x, 0.f) : float3(0.f, -u.z, u.y);
+	}
+	else
+	{
+		n = cross(u, v);  
+	}
+
+	float4 q = float4(n.x, n.y, n.z, r);
+	return NormalizeQuaternion(q);
+}

@@ -1,0 +1,149 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "TressFXVisibilityCommonStruct.ush"
+
+#include "../Common.ush"
+
+//#define SceneTexturesStruct DeepShadowPass.SceneTextures
+
+#include "../SceneTexturesCommon.ush"
+#include "../DeferredShadingCommon.ush"
+#include "TressFXVisibilityCommon.ush"
+#include "../VelocityCommon.ush"
+
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+
+#ifndef HAIR_RENDER_MODE
+#error Undefined hair render mode
+#endif
+
+
+#define SUPPORT_OPACITY_MASK 0
+
+#if HAIR_RENDER_MODE == RENDER_MODE_MSAA || HAIR_RENDER_MODE == RENDER_MODE_PPLL
+#define SUPPORT_MATERIAL_PROPERTY 1
+#endif
+
+#if HAIR_RENDER_MODE == RENDER_MODE_TRANSMITTANCE || HAIR_RENDER_MODE == RENDER_MODE_TRANSMITTANCE_AND_HAIRCOUNT
+#define SUPPORT_MATERIAL_PROPERTY 0
+#endif
+
+#if HAIR_RENDER_MODE == RENDER_MODE_MSAA_VISIBILITY
+#define SUPPORT_MATERIAL_PROPERTY 0
+#endif
+
+
+uint TressFXVisibilityPass_HairMacroGroupIndex;
+uint TressFXVisibilityPass_HairMaterialId;
+uint TressFXVisibilityPass_LightChannelMask;
+
+
+
+void MainVisibility(
+#if HAIR_RENDER_MODE == RENDER_MODE_MSAA_VISIBILITY
+	nointerpolation uint HairPrimitiveId : HAIR_PRIMITIVE_ID 
+#else
+	centroid FVertexFactoryInterpolantsVSToPS Interpolants
+#endif
+	, in float4 SvPosition	: SV_Position
+#if HAIR_RENDER_MODE == RENDER_MODE_MSAA || HAIR_RENDER_MODE == RENDER_MODE_PPLL
+	, centroid in float WorldStrandRadius : TEXCOORD8
+	, const float4 PackedVelocityA : TEXCOORD9
+	, const float4 PackedVelocityC : TEXCOORD12
+#elif HAIR_RENDER_MODE == RENDER_MODE_TRANSMITTANCE || HAIR_RENDER_MODE == RENDER_MODE_TRANSMITTANCE_AND_HAIRCOUNT
+	, centroid in float WorldStrandRadius : TEXCOORD8
+#endif
+	  OPTIONAL_IsFrontFace
+#if HAIR_RENDER_MODE == RENDER_MODE_TRANSMITTANCE
+	, out float OutColor0 : SV_Target0
+#elif HAIR_RENDER_MODE == RENDER_MODE_TRANSMITTANCE_AND_HAIRCOUNT
+	, out float OutColor0 : SV_Target0
+	, out float2 OutColor1 : SV_Target1
+#elif HAIR_RENDER_MODE == RENDER_MODE_MSAA
+	, out uint2 OutColor0	: SV_Target0
+  #if SUPPORT_MATERIAL_PROPERTY
+	, out float4 OutColor1	: SV_Target1
+	, out float4 OutColor2	: SV_Target2
+	, out float2 OutColor3	: SV_Target3
+  #endif
+#elif HAIR_RENDER_MODE == RENDER_MODE_MSAA_VISIBILITY
+	, out uint OutColor0 : SV_Target0
+#endif
+)
+{
+	ResolvedView = ResolveView();
+
+	#if SUPPORT_OPACITY_MASK
+	{
+		FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Interpolants, SvPosition);
+		FPixelMaterialInputs PixelMaterialInputs;
+		CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, bIsFrontFace);
+		clip(GetMaterialMask(PixelMaterialInputs));
+	}
+	#endif
+
+#if HAIR_RENDER_MODE != RENDER_MODE_MSAA_VISIBILITY
+	float Coverage = 1;
+	{
+		bool bUseStableRasterization = false;
+	#if VF_STRAND_TRESSFX
+		bUseStableRasterization = UseStableRasterization();
+	#endif
+
+		FTressFXRenderInfo HairRenderInfo = GetTressFXRenderInfo(ResolvedView.HairRenderInfo, ResolvedView.HairRenderInfoBits, bUseStableRasterization);
+		const float SceneDepth = ConvertFromDeviceZ(SvPosition.z); // Linear depth in world unit
+		const float PixelRadius = HairRenderInfo.bIsOrthoView ? HairRenderInfo.RadiusAtDepth1Primary : SceneDepth * HairRenderInfo.RadiusAtDepth1Primary; // Not correct but the coverage is not used (we count instead the number of sub-sample covered)
+		const float StrandRealRadius = WorldStrandRadius;
+		Coverage = StrandRealRadius / max(StrandRealRadius, PixelRadius);
+	}
+#endif
+
+
+#if HAIR_RENDER_MODE == RENDER_MODE_TRANSMITTANCE
+/*	uint2 vScreenAddress = uint2(SvPosition.xy);
+	uint uDepth = asuint(SvPosition.z);
+    uint uDepth0Prev;
+#if HAS_INVERTED_Z_BUFFER
+	InterlockedMax(TressFXVisibilityPass.ShortCutDepth[vScreenAddress], uDepth, uDepth0Prev);
+#else
+	InterlockedMin(TressFXVisibilityPass.ShortCutDepth[vScreenAddress], uDepth, uDepth0Prev);
+#endif
+*/
+	OutColor0 = saturate(1.0f - Coverage);
+#elif HAIR_RENDER_MODE == RENDER_MODE_TRANSMITTANCE_AND_HAIRCOUNT
+	OutColor0 = saturate(1.0f - Coverage);
+	OutColor1 = float2(Coverage, 1);
+#endif
+
+#if HAIR_RENDER_MODE == RENDER_MODE_MSAA_VISIBILITY
+  #if VF_STRAND_TRESSFX
+	OutColor0 = PackTressFXVisSample(HairPrimitiveId, TressFXVisibilityPass_HairMaterialId);
+  #else
+	OutColor0 = 0;
+  #endif
+#endif
+
+}
+

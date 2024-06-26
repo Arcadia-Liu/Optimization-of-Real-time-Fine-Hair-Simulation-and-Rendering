@@ -1,0 +1,258 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "../Common.ush"
+#include "TressFXSimulationCommon.ush"
+#include "TressFXSimulationSDFCommon.ush"
+
+int NumTotalVertices;
+int NumVerticesPerStrand;
+float CollisionMargin;
+
+RWBuffer<float4> GuidesDeformedPositionBuffer; 
+RWBuffer<float4> GuidesDeformedPrevPositionBuffer; 
+
+struct FCollisionMeshBox
+{
+	float4 Min;
+	float4 Max;
+	float4 CellSize;
+};
+StructuredBuffer<FCollisionMeshBox> CMBoxR;
+
+StructuredBuffer<uint> SDFBufferR;
+
+
+// Get SDF cell index coordinates (x, y and z) from a point position in world space
+int3 GetSdfCoordinates(float3 PositionInWorld)
+{
+    float3 SdfPosition = (PositionInWorld - CMBoxR[0].Min.xyz) / CMBoxR[0].CellSize;
+    
+    int3 Result;
+    Result.x = (int)SdfPosition.x;
+    Result.y = (int)SdfPosition.y;
+    Result.z = (int)SdfPosition.z;
+    
+    return Result;
+}
+
+float3 GetSdfCellPosition(int3 GridPosition)
+{
+    float3 CellCenter = float3(GridPosition.x, GridPosition.y, GridPosition.z) * CMBoxR[0].CellSize.xyz + 0.5*CMBoxR[0].CellSize.xyz;
+    CellCenter += CMBoxR[0].Min.xyz;
+    
+    return CellCenter;
+}
+
+int GetSdfCellIndex(int3 GridPosition)
+{
+    int CellsPerLine = NumSDFCells.x;
+    int CellsPerPlane = NumSDFCells.x * NumSDFCells.y;
+
+    return CellsPerPlane*GridPosition.z + CellsPerLine*GridPosition.y + GridPosition.x;
+}
+
+float LinearInterpolate(float a, float b, float t)
+{
+	return a * (1.0f - t) + b * t;
+}
+
+//    bilinear interpolation
+//
+//         p    :  1-p
+//     c------------+----d
+//     |            |    |
+//     |            |    |
+//     |       1-q  |    |
+//     |            |    |
+//     |            x    |
+//     |            |    |
+//     |         q  |    |
+//     a------------+----b
+//         p    :  1-p
+//
+//    x = BilinearInterpolate(a, b, c, d, p, q)
+//      = LinearInterpolate(LinearInterpolate(a, b, p), LinearInterpolate(c, d, p), q)
+float BilinearInterpolate(float a, float b, float c, float d, float p, float q)
+{
+	return LinearInterpolate( LinearInterpolate(a, b, p), LinearInterpolate(c, d, p), q );
+}
+
+//    trilinear interpolation
+//
+//                      c        p            1-p    d
+//                       ------------------+----------
+//                      /|                 |        /|
+//                     /                   |       / |
+//                    /  |                 |1-q   /  |
+//                   /                     |     /   |
+//                  /    |                 |    /    |
+//               g ------------------+---------- h   |
+//                 |     |           |     |   |     |
+//                 |                 |     +   |     |
+//                 |     |           |   r/|   |     |
+//                 |                 |   / |q  |     |
+//                 |     |           |  x  |   |     |
+//                 |   a - - - - - - | / - + - |- - -| b
+//                 |    /            |/1-r     |     /
+//                 |                 +         |    /
+//                 |  /              |         |   /
+//                 |                 |         |  /
+//                 |/                |         | /
+//                 ------------------+----------
+//              e                            f
+//
+//		x = TrilinearInterpolate(a, b, c, d, e, f, g, h, p, q, r)
+//		  = LinearInterpolate(BilinearInterpolate(a, b, c, d, p, q), BilinearInterpolate(e, f, g, h, p, q), r)
+float TrilinearInterpolate(float a, float b, float c, float d, float e, float f, float g, float h, float p, float q, float r)
+{
+	return LinearInterpolate(BilinearInterpolate(a, b, c, d, p, q), BilinearInterpolate(e, f, g, h, p, q), r);
+}
+
+// Get signed Distance at the position in world space
+float GetSignedDistance(float3 PositionInWorld)
+{
+	int3 GridCoords = GetSdfCoordinates(PositionInWorld);
+	
+	if( !(0 <= GridCoords.x && GridCoords.x < NumSDFCells.x)
+	 || !(0 <= GridCoords.y && GridCoords.y < NumSDFCells.y)
+	 || !(0 <= GridCoords.z && GridCoords.z < NumSDFCells.z) ) 
+		return INITIAL_DISTANCE;
+	
+	int SdfIndices[8];
+	{
+		int Index = GetSdfCellIndex(GridCoords);
+		for(int i = 0; i < 8; ++i) SdfIndices[i] = Index;
+		
+		int x = 1;
+		int y = NumSDFCells.x;
+		int z = NumSDFCells.y * NumSDFCells.x;
+		
+		SdfIndices[1] += x;
+		SdfIndices[2] += y;
+		SdfIndices[3] += y + x;
+		
+		SdfIndices[4] += z;
+		SdfIndices[5] += z + x;
+		SdfIndices[6] += z + y;
+		SdfIndices[7] += z + y + x;
+	}
+	
+	float Distances[8];
+
+	for(int j = 0; j < 8; ++j)
+	{
+		int SdfCellIndex = SdfIndices[j];
+		float Dist = asfloat(SDFBufferR[SdfCellIndex]);
+
+		if(Dist == INITIAL_DISTANCE) 
+			return INITIAL_DISTANCE;
+		
+		Distances[j] = Dist;
+	}
+	
+	float Distance_000 = Distances[0];	// X,  Y,  Z
+	float Distance_100 = Distances[1];	//+X,  Y,  Z
+	float Distance_010 = Distances[2];	// X, +Y,  Z
+	float Distance_110 = Distances[3];	//+X, +Y,  Z
+	float Distance_001 = Distances[4];	// X,  Y, +Z
+	float Distance_101 = Distances[5];	//+X,  Y, +Z
+	float Distance_011 = Distances[6];	// X, +Y, +Z
+	float Distance_111 = Distances[7];	//+X, +Y, +Z
+	
+	float3 CellPosition = GetSdfCellPosition(GridCoords);
+	float3 Interp = (PositionInWorld - CellPosition) / CMBoxR[0].CellSize;
+	return TrilinearInterpolate(Distance_000, Distance_100, Distance_010, Distance_110,
+								Distance_001, Distance_101, Distance_011, Distance_111,
+								Interp.x, Interp.y, Interp.z);
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CollideStrandsVerticesWithSDF_Forward(uint GIndex : SV_GroupIndex,
+	                          uint3 GId : SV_GroupID,
+	                          uint3 DTid : SV_DispatchThreadID)
+{
+	int VertexGlobalIndex = GId.x * THREAD_GROUP_SIZE + GIndex;
+	
+	if(VertexGlobalIndex >= NumTotalVertices)
+		return;
+	
+	int VertexLocalIndex = VertexGlobalIndex % NumVerticesPerStrand;
+
+	// We don't run collision check on the first two vertices in the strand. They are fixed on the skin mesh. 
+	//if (VertexLocalIndex == 0 || VertexLocalIndex == 1)
+	if (VertexLocalIndex < 2)
+		return;
+
+	float4 Vertex = GuidesDeformedPositionBuffer[VertexGlobalIndex];
+	float4 VertexInSdfLocalSpace = Vertex;
+	
+	float Distance = GetSignedDistance(VertexInSdfLocalSpace.xyz);
+	
+	// early exit if the Distance is larger than collision margin
+	float SDFCollisionMargin = CollisionMargin*CMBoxR[0].CellSize.w;
+	if(Distance > SDFCollisionMargin) 
+		return;
+	
+	// small displacement. 
+	float3 h = 0.1f * CMBoxR[0].CellSize;
+
+	float3 SdfGradient;
+	{
+		//Compute gradient using forward difference
+		float3 Offset[3];
+		Offset[0] = float3(1, 0, 0);
+		Offset[1] = float3(0, 1, 0);
+		Offset[2] = float3(0, 0, 1);
+		
+		float3 NeighborCellPositions[3];
+
+		for(int i = 0; i < 3; ++i) 
+			NeighborCellPositions[i] = VertexInSdfLocalSpace.xyz + Offset[i] * h;
+		
+		//Use trilinear interpolation to get distances
+		float NeighborCellDistances[3];
+
+		for(int j = 0; j < 3; ++j) 
+			NeighborCellDistances[j] = GetSignedDistance(NeighborCellPositions[j]);
+		
+		float3 ForwardDistances;
+		ForwardDistances.x = NeighborCellDistances[0];
+		ForwardDistances.y = NeighborCellDistances[1];
+		ForwardDistances.z = NeighborCellDistances[2];
+		
+		SdfGradient = ( ForwardDistances - float3(Distance, Distance, Distance) ) / h;
+	}
+	
+	//Project hair vertex out of SDF
+	float3 Normal = normalize(SdfGradient);
+	
+	if(Distance < SDFCollisionMargin)
+	{
+		float3 ProjectedVertex = Vertex.xyz + Normal * (SDFCollisionMargin - Distance);
+		GuidesDeformedPositionBuffer[VertexGlobalIndex] = float4(ProjectedVertex,Vertex.w);
+//		GuidesDeformedPrevPositionBuffer[VertexGlobalIndex] = float4(ProjectedVertex,Vertex.w);
+	}
+
+}
+

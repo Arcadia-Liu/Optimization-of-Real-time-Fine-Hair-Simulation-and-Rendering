@@ -1,0 +1,469 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+#include "../VertexFactoryCommon.ush"
+#include "TressFXVisibilityCommon.ush"
+#include "TressFXVertexFactoryCommon.ush"
+
+#include "/Engine/Generated/UniformBuffers/PrecomputedLightingBuffer.ush"
+
+
+
+
+float3 TressFXVF_PositionOffset;			// Vertex position (3x16bits) are relative to this offset for improving precision while keeping vertex footprint low
+float3 TressFXVF_PreviousPositionOffset;	// Vertex position (3x16bits) are relative to this offset for improving precision while keeping vertex footprint low
+float  TressFXVF_Density;
+float  TressFXVF_Radius;
+float  TressFXVF_Length;
+uint   TressFXVF_CullingEnable;
+uint   TressFXVF_bUseStableRasterization;
+uint   TressFXVF_bScatterSceneLighing;
+uint	TressFXVF_NumVerticesPerStrand;
+
+
+
+Buffer<float4>				TressFXVF_PositionBuffer;
+Buffer<float4>				TressFXVF_PreviousPositionBuffer;
+Buffer<uint4>				TressFXVF_AttributeBuffer;
+Buffer<float4>				TressFXVF_MaterialBuffer;
+Buffer<float4>				TressFXVF_TangentBuffer;
+StructuredBuffer<float2>	TressFXVF_RootUVBuffer;
+StructuredBuffer<uint>		TressFXVF_StrandsIDBuffer;
+
+
+bool UseStableRasterization()
+{
+	return TressFXVF_bUseStableRasterization > 0;
+}
+
+bool UseScatterSceneLighting()
+{
+	return TressFXVF_bScatterSceneLighing > 0;
+}
+
+
+struct FVertexFactoryInput
+{ 
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	uint PrimitiveId : ATTRIBUTE13;
+#endif	
+	uint VertexId : SV_VertexID;
+};
+ 
+struct FVertexInfo
+{
+	uint QuadIndex;
+	uint BaseIndex;
+	uint VertexIndex;
+	uint HairPrimitiveId;
+	uint IsTip;				// The vertex is on the quad side toward the tip of the strand.
+	uint IsLeft;
+	float LodRadiusScale;
+	bool bForceInvalidQuad;
+};
+FVertexInfo GetVertexInfo(FVertexFactoryInput Input)
+{
+	uint VertexId = Input.VertexId;
+
+	FVertexInfo VertexInfo;
+	VertexInfo.QuadIndex	= VertexId % 6;
+	VertexInfo.BaseIndex	= VertexId / 6;
+	VertexInfo.IsTip		= VertexInfo.QuadIndex == 0 || VertexInfo.QuadIndex == 2 || VertexInfo.QuadIndex == 4 ? 0 : 1;
+	VertexInfo.IsLeft		= VertexInfo.QuadIndex == 0 || VertexInfo.QuadIndex == 1 || VertexInfo.QuadIndex == 5 ? 1 : 0;
+
+	VertexInfo.HairPrimitiveId = VertexInfo.BaseIndex;
+	VertexInfo.VertexIndex = VertexInfo.BaseIndex + VertexInfo.IsTip;
+	VertexInfo.LodRadiusScale = 1.0f;
+	VertexInfo.bForceInvalidQuad = false;
+#if USE_CULLED_CLUSTER == 1
+	if (TressFXVF_CullingEnable)
+	{
+	}
+#endif
+
+	return VertexInfo;
+}
+
+uint GetPrimitiveId(FVertexFactoryInput Input)
+{
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	return Input.PrimitiveId;
+#else
+	return 0;
+#endif
+}
+
+#define FPositionOnlyVertexFactoryInput FVertexFactoryInput
+#define FPositionAndNormalOnlyVertexFactoryInput FVertexFactoryInput
+
+
+struct FVertexFactoryIntermediates
+{
+	half3x3 TangentToLocal;
+	half3x3 TangentToWorld;
+	half TangentToWorldSign;
+	uint PrimitiveId;
+	uint HairPrimitiveId;
+	float2 HairPrimitiveUV;
+	float2 HairDimensions;  // This is kept on the intermediate as this is used in several vertex shader for the actual coverage.
+	float  HairDensity;
+};
+
+FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVSToPS Interpolants, float4 SvPosition)
+{
+	// GetMaterialPixelParameters is responsible for fully initializing the result
+	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
+	
+	half3 TangentToWorld0 = GetTangentToWorld0(Interpolants).xyz;
+	half4 TangentToWorld2 = GetTangentToWorld2(Interpolants);
+	Result.UnMirrored = TangentToWorld2.w;
+
+	// Required for previewing materials that use ParticleColor
+	Result.Particle.Color = half4(1,1,1,1);
+
+	Result.TangentToWorld = AssembleTangentToWorld( TangentToWorld0, TangentToWorld2 );
+#if USE_WORLDVERTEXNORMAL_CENTER_INTERPOLATION
+	Result.WorldVertexNormal_Center = Interpolants.TangentToWorld2_Center.xyz;
+#endif
+
+	Result.TwoSidedSign = 1;
+	Result.PrimitiveId = GetPrimitiveId(Interpolants);
+	Result.HairPrimitiveId = Interpolants.HairPrimitiveId;
+	Result.HairPrimitiveUV = float2(Interpolants.HairPrimitiveUV);
+	
+	#if NUM_TEX_COORD_INTERPOLATORS > 0
+		Result.TexCoords[0] = Interpolants.TexCoords[0].xy;
+		#if NUM_TEX_COORD_INTERPOLATORS > 1
+			Result.TexCoords[1] = float2(Interpolants.HairPrimitiveUV.x,Interpolants.TexCoords[0].w+Interpolants.HairPrimitiveUV.y/TressFXVF_NumVerticesPerStrand);
+		#endif
+	#endif
+
+#if COMPILER_SUPPORTS_TO_SCALAR_MEMORY
+//	Result.PrimitiveId = ToScalarMemory(Result.PrimitiveId);
+#endif
+
+	return Result;
+}
+
+
+FTressFXControlPoint GetVertexPosition(const FVertexInfo VertexInfo, bool bInvalidJointVertex=true)
+{
+	const uint4 PackedData = TressFXVF_PositionBuffer[VertexInfo.VertexIndex];
+	FTressFXControlPoint Out = UnpackTressFXControlPoint(
+		PackedData, 
+		TressFXVF_PositionOffset, 
+		TressFXVF_Radius * VertexInfo.LodRadiusScale, 
+		TressFXVF_Length);
+	
+	// Create a degenerated quad the end of each strand to cut between each strands
+	// #hair_todo: This is not efficient for short strand like fur for instance. Need to revisit that at some point
+	const bool bIsInvalidQuad = (bInvalidJointVertex && Out.Type == TRESSFX_CONTROLPOINT_START && VertexInfo.IsTip == 1) || (bInvalidJointVertex && Out.Type == TRESSFX_CONTROLPOINT_END && VertexInfo.IsTip == 0) || VertexInfo.bForceInvalidQuad;
+	Out.Position = bIsInvalidQuad ? float3(INFINITE_FLOAT, INFINITE_FLOAT, INFINITE_FLOAT) : Out.Position;
+
+	return Out;
+}
+
+FTressFXControlPoint GetVertexPosition(FVertexFactoryInput Input, bool bInvalidJointVertex=true)
+{
+	const FVertexInfo VertexInfo = GetVertexInfo(Input);
+	return GetVertexPosition(VertexInfo, bInvalidJointVertex);
+}
+
+
+uint GetHairPrimitiveId(FVertexFactoryInput Input)
+{
+	return GetVertexInfo(Input).HairPrimitiveId;
+}
+
+float2 GetSegmentUVCoord(FVertexFactoryInput Input)
+{
+	FVertexInfo VertexInfo = GetVertexInfo(Input);
+	const float VCoord = VertexInfo.IsLeft ? 0.0f : 1.0f;
+	const float UCoord = VertexInfo.IsTip  ? 1.0f : 0.0f;
+	return float2(UCoord, VCoord);
+}
+
+float GetWorldStrandRadius(FVertexFactoryInput Input)
+{
+	return GetVertexPosition(Input).WorldRadius;
+}
+
+float GetWorldStrandLength(FVertexFactoryInput Input)
+{
+	return GetVertexPosition(Input).WorldLength;
+}
+
+float3 GetVertexPreviousPosition(FVertexFactoryInput Input, bool bInvalidJointVertex = true)
+{
+	FVertexInfo VertexInfo = GetVertexInfo(Input);
+	const uint4 PackedData = TressFXVF_PreviousPositionBuffer[VertexInfo.VertexIndex];
+	FTressFXControlPoint Out = UnpackTressFXControlPoint(
+		PackedData,
+		TressFXVF_PreviousPositionOffset,
+		TressFXVF_Radius * VertexInfo.LodRadiusScale,
+		TressFXVF_Length);
+
+	// Create a degenerated quad the end of each strand to cut between each strands
+	// #hair_todo: This is not efficient for short strand like fur for instance. Need to revisit that at some point
+	const bool bIsInvalidQuad = (bInvalidJointVertex && Out.Type == TRESSFX_CONTROLPOINT_START && VertexInfo.IsTip == 1) || (bInvalidJointVertex && Out.Type == TRESSFX_CONTROLPOINT_END && VertexInfo.IsTip == 0) || VertexInfo.bForceInvalidQuad;
+	Out.Position = bIsInvalidQuad ? float3(INFINITE_FLOAT, INFINITE_FLOAT, INFINITE_FLOAT) : Out.Position;
+
+	return Out.Position;
+}
+
+FMaterialVertexParameters GetMaterialVertexParameters(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float3 WorldPosition, half3x3 TangentToLocal)
+{
+	FMaterialVertexParameters Result = (FMaterialVertexParameters)0;
+	Result.WorldPosition = WorldPosition;
+
+	// does not handle instancing!
+	Result.TangentToWorld = Intermediates.TangentToWorld;
+	
+	Result.PrevFrameLocalToWorld = GetPrimitiveData(Intermediates.PrimitiveId).PreviousLocalToWorld;
+	Result.PreSkinnedPosition = GetVertexPreviousPosition(Input);
+	Result.PreSkinnedNormal = TangentToLocal[2];
+	Result.PrimitiveId = Intermediates.PrimitiveId;
+	return Result;
+}
+
+half3x3 CalcTangentToWorldNoScale(FVertexFactoryIntermediates Intermediates, half3x3 TangentToLocal)
+{
+	half3x3 LocalToWorld = GetLocalToWorld3x3(Intermediates.PrimitiveId);
+	half3 InvScale = GetPrimitiveData(Intermediates.PrimitiveId).InvNonUniformScaleAndDeterminantSign.xyz;
+	LocalToWorld[0] *= InvScale.x;
+	LocalToWorld[1] *= InvScale.y;
+	LocalToWorld[2] *= InvScale.z;
+	return mul(TangentToLocal, LocalToWorld); 
+}
+
+half3x3 CalcTangentToLocal(FVertexFactoryInput Input, inout float TangentSign)
+{
+	FVertexInfo VertexInfo = GetVertexInfo(Input);
+	const half3 TangentInputX = TressFXVF_TangentBuffer[VertexInfo.VertexIndex * 2 + 0].xyz;
+	const half4 TangentInputZ = TressFXVF_TangentBuffer[VertexInfo.VertexIndex * 2 + 1];
+
+	half3 TangentX = TangentBias(TangentInputX);
+	half4 TangentZ = TangentBias(TangentInputZ);
+	TangentSign = TangentZ.w;
+	
+	// derive the binormal by getting the cross product of the normal and tangent
+	half3 TangentY = cross(TangentZ.xyz, TangentX) * TangentZ.w;
+	
+	// Recalculate TangentX off of the other two vectors
+	// This corrects quantization error since TangentX was passed in as a quantized vertex input
+	// The error shows up most in specular off of a mesh with a smoothed UV seam (normal is smooth, but tangents vary across the seam)
+	half3x3 Result;
+	Result[0] = cross(TangentY, TangentZ.xyz) * TangentZ.w;
+	Result[1] = TangentY;
+	Result[2] = TangentZ.xyz;
+
+	return Result;
+}
+
+half3x3 CalcTangentToWorld(FVertexFactoryIntermediates Intermediates, half3x3 TangentToLocal)
+{
+	half3x3 LocalTangentToWorld = CalcTangentToWorldNoScale(Intermediates, TangentToLocal);
+	return LocalTangentToWorld;
+}
+
+float3 GetTangent(FVertexFactoryInput Input)
+{
+	FVertexFactoryIntermediates Intermediates;
+	Intermediates.PrimitiveId = GetPrimitiveId(Input);
+
+	float TangentSign;
+	Intermediates.TangentToLocal = CalcTangentToLocal(Input, TangentSign);
+	Intermediates.TangentToWorld = CalcTangentToWorld(Intermediates,Intermediates.TangentToLocal);
+	Intermediates.TangentToWorldSign = TangentSign * GetPrimitiveData(Intermediates.PrimitiveId).InvNonUniformScaleAndDeterminantSign.w;
+
+	// Hair shader expec the tangent to be stored in place of the normal. This is what the StrandHairComponent is filling in:
+	// [0]: Real normal		| Should be Tangent
+	// [1]: Bitangent		| Should be BiTangent
+	// [2]: Real Tangent	| Should be Normal
+	return Intermediates.TangentToWorld[2].xyz;
+}
+
+
+FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
+{
+	FVertexFactoryIntermediates Intermediates;
+	Intermediates.PrimitiveId		= GetPrimitiveId(Input);
+	Intermediates.HairPrimitiveId	= GetHairPrimitiveId(Input);
+	Intermediates.HairPrimitiveUV	= GetSegmentUVCoord(Input);
+	Intermediates.HairDensity		= TressFXVF_Density;
+	Intermediates.HairDimensions	= float2(GetWorldStrandLength(Input), TressFXVF_Radius);//GetWorldStrandRadius(Input));
+
+	float TangentSign;
+	Intermediates.TangentToLocal = CalcTangentToLocal(Input, TangentSign);
+	Intermediates.TangentToWorld = CalcTangentToWorld(Intermediates,Intermediates.TangentToLocal);
+	Intermediates.TangentToWorldSign = TangentSign * GetPrimitiveData(Intermediates.PrimitiveId).InvNonUniformScaleAndDeterminantSign.w;	
+	return Intermediates;
+}
+
+float4 CalcWorldPosition(float3 Position, uint PrimitiveId)
+{
+	return TransformLocalToTranslatedWorld(Position, PrimitiveId);
+}
+
+half3x3 VertexFactoryGetTangentToLocal( FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates )
+{
+	return Intermediates.TangentToLocal;
+}
+
+float4 ComputeViewAlignedWorldPosition(FVertexFactoryInput Input, float3 WorldTangent, float4 WorldPosition, float WorldStrandRadius, FTressFXViewInfo HairViewInfo)
+{
+	FVertexInfo VertexInfo = GetVertexInfo(Input);
+
+	// Minimal radius to snap the strand to a sample/pixel center (to avoid aliasing)
+	const float DistanceToCamera = length(HairViewInfo.TranslatedWorldCameraOrigin - WorldPosition.xyz);
+	const float MinStrandHairRadius = HairViewInfo.bIsOrthoView ? HairViewInfo.RadiusAtDepth1 : (DistanceToCamera * HairViewInfo.RadiusAtDepth1);
+	const float3 ViewDir = -HairViewInfo.ViewForward;
+	const float3 Right = normalize(cross(WorldTangent, ViewDir));
+	const float3 OutWorldPosition = WorldPosition.xyz + (VertexInfo.IsLeft ? -Right : Right) * max(WorldStrandRadius, MinStrandHairRadius);
+	
+	return float4(OutWorldPosition, 1);
+}
+
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FTressFXViewInfo HairViewInfo)
+{
+	//FTressFXControlPoint ControlPoint = GetVertexPosition(Input);
+	//const float3 VertexPosition = ControlPoint.Position;
+	
+	const FVertexInfo VertexInfo = GetVertexInfo(Input);
+	float4 VertexPosition = TressFXVF_PositionBuffer[VertexInfo.VertexIndex];
+	uint Type = asuint(VertexPosition.w) & 0x3;
+
+	const bool bIsInvalidQuad = (Type == TRESSFX_CONTROLPOINT_START && VertexInfo.IsTip == 1) || (Type == TRESSFX_CONTROLPOINT_END && VertexInfo.IsTip == 0);
+	VertexPosition.xyz = bIsInvalidQuad ? float3(INFINITE_FLOAT, INFINITE_FLOAT, INFINITE_FLOAT) : VertexPosition.xyz;
+
+	//const float4 TranslatedWorldPosition = CalcWorldPosition(VertexPosition.xyz, Intermediates.PrimitiveId);
+	const float4 TranslatedWorldPosition = float4(VertexPosition.xyz+ResolvedView.PreViewTranslation.xyz,1);//
+
+	// Hair shader expect the WorldNormal to be the tangent vector
+	const float3 WorldTangent = GetTangent(Input);
+	return ComputeViewAlignedWorldPosition(Input, WorldTangent, TranslatedWorldPosition, TressFXVF_Radius, HairViewInfo);
+}
+
+// This function is referenced by several "system" shaders, but none of these shaders (apart HitProxy, are actually used)
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	const FTressFXRenderInfo HairRenderInfo = GetTressFXRenderInfo(ResolvedView.HairRenderInfo, ResolvedView.HairRenderInfoBits, UseStableRasterization());
+
+	FTressFXViewInfo HairViewInfo;
+	HairViewInfo.TranslatedWorldCameraOrigin = ResolvedView.TranslatedWorldCameraOrigin;
+	HairViewInfo.ViewForward = ResolvedView.ViewForward;
+	HairViewInfo.RadiusAtDepth1 = HairRenderInfo.RadiusAtDepth1Primary;
+	HairViewInfo.bIsOrthoView = HairRenderInfo.bIsOrthoView;
+
+	return VertexFactoryGetWorldPosition(Input, Intermediates, HairViewInfo);
+}
+
+float4 VertexFactoryGetWorldPosition(FPositionOnlyVertexFactoryInput Input)
+{
+	return 0; 
+}
+
+// @return translated world position (without quad extension/reorientation).This is used only for velocity computation
+float4 VertexFactoryGetWorldPositionRaw(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, bool bInvalidJointVertex = true)
+{	
+	const FVertexInfo VertexInfo = GetVertexInfo(Input);
+	float4 VertexPosition = TressFXVF_PositionBuffer[VertexInfo.VertexIndex];
+//	uint Type = asuint(VertexPosition.w) & 0x3;
+
+//	const bool bIsInvalidQuad = (Type == TRESSFX_CONTROLPOINT_START && VertexInfo.IsTip == 1) || (Type == TRESSFX_CONTROLPOINT_END && VertexInfo.IsTip == 0);
+//	VertexPosition.xyz = bIsInvalidQuad ? float3(INFINITE_FLOAT, INFINITE_FLOAT, INFINITE_FLOAT) : VertexPosition.xyz;
+
+	//const float4 TranslatedWorldPosition = CalcWorldPosition(VertexPosition.xyz, Intermediates.PrimitiveId);
+	const float4 TranslatedWorldPosition = float4(VertexPosition.xyz+ResolvedView.PreViewTranslation.xyz,1);//
+	
+	return TranslatedWorldPosition;
+	//return CalcWorldPosition(GetVertexPosition(Input, bInvalidJointVertex).Position, Intermediates.PrimitiveId);
+}
+
+float4 VertexFactoryGetPreviousWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, bool bInvalidJointVertex = true)
+{
+//	float4x4 PreviousLocalToWorldTranslated = GetPrimitiveData(Intermediates.PrimitiveId).PreviousLocalToWorld;
+//	PreviousLocalToWorldTranslated[3][0] += ResolvedView.PrevPreViewTranslation.x;
+//	PreviousLocalToWorldTranslated[3][1] += ResolvedView.PrevPreViewTranslation.y;
+//	PreviousLocalToWorldTranslated[3][2] += ResolvedView.PrevPreViewTranslation.z;
+		
+	const FVertexInfo VertexInfo = GetVertexInfo(Input);
+	float4 VertexPosition = TressFXVF_PreviousPositionBuffer[VertexInfo.VertexIndex];
+//	uint Type = asuint(VertexPosition.w) & 0x3;
+
+//	const bool bIsInvalidQuad = (Type == TRESSFX_CONTROLPOINT_START && VertexInfo.IsTip == 1) || (Type == TRESSFX_CONTROLPOINT_END && VertexInfo.IsTip == 0);
+//	VertexPosition.xyz = bIsInvalidQuad ? float3(INFINITE_FLOAT, INFINITE_FLOAT, INFINITE_FLOAT) : VertexPosition.xyz;
+
+	//const float3 VertexPosition = GetVertexPreviousPosition(Input, bInvalidJointVertex);
+	//return mul(float4(VertexPosition.xyz,1), PreviousLocalToWorldTranslated);
+	return float4(VertexPosition.xyz+ResolvedView.PrevPreViewTranslation.xyz,1);
+}
+
+
+float4 VertexFactoryGetRasterizedWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float4 InWorldPosition)
+{
+	return InWorldPosition;
+}
+
+float3 VertexFactoryGetWorldNormal(FPositionAndNormalOnlyVertexFactoryInput Input)
+{
+	return float3(0, 0, 1); 
+}
+
+float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return float3(0,0,1);
+}
+
+FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
+{
+	FVertexFactoryInterpolantsVSToPS Interpolants;
+
+	// Initialize the whole struct to 0
+	// Really only the last two components of the packed UVs have the opportunity to be uninitialized
+	Interpolants = (FVertexFactoryInterpolantsVSToPS)0;
+	
+	const FVertexInfo VertexInfo = GetVertexInfo(Input);
+	uint StrandID = VertexInfo.VertexIndex / TressFXVF_NumVerticesPerStrand;
+	StrandID = TressFXVF_StrandsIDBuffer[StrandID];
+	float2 RootUV = TressFXVF_RootUVBuffer[StrandID].xy;
+	float2 StrandUV = float2(VertexInfo.IsLeft ? 0 : 1.0, float(VertexInfo.VertexIndex%TressFXVF_NumVerticesPerStrand)/TressFXVF_NumVerticesPerStrand);
+
+	#if NUM_TEX_COORD_INTERPOLATORS > 0
+		Interpolants.TexCoords[0].xy = RootUV;
+		#if NUM_TEX_COORD_INTERPOLATORS > 1
+			Interpolants.TexCoords[0].zw = StrandUV;
+		#endif
+	#endif
+
+	SetTangents(Interpolants, Intermediates.TangentToWorld[0], Intermediates.TangentToWorld[2], Intermediates.TangentToWorldSign);
+
+#if INSTANCED_STEREO
+	Interpolants.EyeIndex = 0;
+#endif
+	
+	Interpolants.HairPrimitiveId = GetHairPrimitiveId(Input);
+	Interpolants.HairPrimitiveUV = GetSegmentUVCoord(Input);
+	SetPrimitiveId(Interpolants, Intermediates.PrimitiveId);
+	 
+	return Interpolants;
+}

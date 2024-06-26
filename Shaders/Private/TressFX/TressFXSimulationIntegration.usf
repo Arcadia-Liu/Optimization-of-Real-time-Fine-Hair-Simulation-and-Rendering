@@ -1,0 +1,280 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "TressFXSimulationCommon.ush"
+
+
+uint PrimitiveId;
+
+float3 GuidesRestPositionOffset;
+
+Buffer<uint4>  GuidesRestPositionBuffer;
+
+RWBuffer<float4> GuidesDeformedPositionBuffer; 
+RWBuffer<float4> GuidesDeformedPrevPositionBuffer;
+RWBuffer<float4> GuidesDeformedPrevPrevPositionBuffer;
+
+float ResetPositions;
+
+float MaxRestLength;
+float DampingCoeff;
+float TimeStep;
+float GlobalShapeStiffness;
+float GlobalShapeEffectiveRange;
+
+#define GravityMagnitude 10.f
+
+
+float4 Integrate(float4 CurPosition, float4 OldPosition, float4 Force)
+{
+    float4 OutputPos = CurPosition;
+
+    Force.xyz += GravityMagnitude * float3(0.0f, 0.0f, -1.0f);
+	
+	float Decay = exp(-DampingCoeff * TimeStep * 60.0f);
+    OutputPos.xyz = CurPosition.xyz + Decay*(CurPosition.xyz - OldPosition.xyz) + Force.xyz*TimeStep*TimeStep;
+
+    return OutputPos;
+}
+
+void UpdateFinalVertexPositions(float4 OldPosition, float4 NewPosition, int GlobalVertexIndex, int LocalVertexIndex, int NumVerticesInTheStrand)
+{
+	GuidesDeformedPrevPrevPositionBuffer[GlobalVertexIndex] = GuidesDeformedPrevPositionBuffer[GlobalVertexIndex];
+	GuidesDeformedPrevPositionBuffer[GlobalVertexIndex] = OldPosition;
+    GuidesDeformedPositionBuffer[GlobalVertexIndex] = NewPosition;
+}
+
+//	float4x4 LocalToWorld = GetPrimitiveData(PrimitiveId).LocalToWorld;
+//	WorldVertexPosition = mul(float4(VertexPosition,1),LocalToWorld).xyz;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void IntegrationAndGlobalShapeConstraints(uint GIndex : SV_GroupIndex,
+                  uint3 GId : SV_GroupID,
+                  uint3 DTid : SV_DispatchThreadID)
+{
+    uint GlobalStrandIndex, LocalStrandIndex, GlobalVertexIndex, LocalVertexIndex, NumVerticesInTheStrand, IndexForSharedMem, StrandType;
+    CalcIndicesInVertexLevelMaster(GIndex, GId.x, GlobalStrandIndex, LocalStrandIndex, GlobalVertexIndex, LocalVertexIndex, NumVerticesInTheStrand, IndexForSharedMem, StrandType);
+
+	uint4 PackedRestPosition = GuidesRestPositionBuffer[GlobalVertexIndex];
+	float3 RestPos = f16tof32(PackedRestPosition.xyz) + GuidesRestPositionOffset;
+	const uint ControlChannel = asuint(PackedRestPosition.w);
+
+	FBoneIndexData IndexData = GuidesBoneIndexBuffer[GlobalStrandIndex];
+	
+	float4 BoneQuat;
+	float3 InitialPos = ApplyVertexBoneSkinning(RestPos, IndexData, BoneQuat);
+	
+    // position when this step starts. In other words, a position from the last step.
+    float4 CurrentPos = GuidesDeformedPositionBuffer[GlobalVertexIndex];
+
+	
+    // Integrate
+    float4 OldPos;
+    OldPos = GuidesDeformedPrevPositionBuffer[GlobalVertexIndex];
+	
+	if ( ResetPositions != 0.0f )
+	{
+		CurrentPos.xyz = InitialPos;
+		OldPos.xyz = InitialPos;
+	}
+	
+    float4 Force = float4(0, 0, 0, 0);
+	float4 TempPos;
+	if ( IsMovable(ControlChannel) )
+        TempPos = Integrate(CurrentPos, OldPos, Force);
+    else
+        TempPos = float4(InitialPos,0);
+
+	// Global Shape Constraints
+	if(GlobalShapeStiffness > 0 && GlobalShapeEffectiveRange > 0)
+	{
+        if ( IsMovable(ControlChannel) )
+        {
+            if ( (float)LocalVertexIndex < GlobalShapeEffectiveRange * (float)NumVerticesInTheStrand )
+            {
+                float3 Del = GlobalShapeStiffness * (InitialPos - TempPos.xyz);
+                TempPos.xyz += Del;
+            }
+        }
+	}
+
+	// update global position buffers
+	UpdateFinalVertexPositions(CurrentPos, float4(TempPos.xyz,asfloat(PackedRestPosition.w)), GlobalVertexIndex, LocalVertexIndex, NumVerticesInTheStrand);
+}
+
+
+struct FMTMeshTriangle
+{
+	float3 P0;
+	float3 P1;
+	float3 P2;
+
+	float3 E0;
+	float3 E1;
+
+	float3 N;
+};
+
+float3 ToTriangleLocal(const float3 P, float3 B, const FMTMeshTriangle T)
+{
+	const float3 LocalB = T.P0 * B.x + T.P1 * B.y + T.P2 * B.z;
+	const float3 LocalP = P - LocalB;
+
+	float3 Out;
+	Out.x = dot(LocalP, T.E0);
+	Out.y = dot(LocalP, T.E1);
+	Out.z = dot(LocalP, T.N);
+	
+	return Out;
+}
+
+float3 ToTriangleWorld(const float3 P, float3 B, const FMTMeshTriangle T)
+{
+	const float3 Rotation = P.x * T.E0 + P.y * T.E1 + P.z * T.N;
+	const float3 Translation = T.P0 * B.x + T.P1 * B.y + T.P2 * B.z;
+
+	return Rotation + Translation;
+}
+
+float4x4 CompToWorld;
+
+Buffer<float> MeshPositionRestBuffer;
+Buffer<float> MeshPositionDeformedBuffer;
+
+
+struct FGuideRootTriangle 
+{
+	float2 TriBarycentrices;
+	uint Vertex0Index;
+	uint Vertex1Index;
+    uint Vertex2Index;
+};
+StructuredBuffer<FGuideRootTriangle> GuidesRootBindingTrianglesBuffer;
+StructuredBuffer<uint> GuidesLocalToGlobalVertexIndexMapBuffer;
+
+float3 ApplyBlendShapeSkinning(float3 VertexPos, uint GlobalStrandIndex)
+{
+    FGuideRootTriangle Info = GuidesRootBindingTrianglesBuffer[GlobalStrandIndex];
+
+    float3 Bary = float3(Info.TriBarycentrices.xy,1 - Info.TriBarycentrices.x - Info.TriBarycentrices.y);
+
+    // Get the Rest RootTriangle pos
+	uint Vertex0GlobalIndex = GuidesLocalToGlobalVertexIndexMapBuffer[Info.Vertex0Index]*3;
+	uint Vertex1GlobalIndex = GuidesLocalToGlobalVertexIndexMapBuffer[Info.Vertex1Index]*3;
+	uint Vertex2GlobalIndex = GuidesLocalToGlobalVertexIndexMapBuffer[Info.Vertex2Index]*3;
+	FMTMeshTriangle RestTriangle;
+	RestTriangle.P0 = float3(MeshPositionRestBuffer[Vertex0GlobalIndex],MeshPositionRestBuffer[Vertex0GlobalIndex+1],MeshPositionRestBuffer[Vertex0GlobalIndex+2]);
+	RestTriangle.P1 = float3(MeshPositionRestBuffer[Vertex1GlobalIndex],MeshPositionRestBuffer[Vertex1GlobalIndex+1],MeshPositionRestBuffer[Vertex1GlobalIndex+2]);
+	RestTriangle.P2 = float3(MeshPositionRestBuffer[Vertex2GlobalIndex],MeshPositionRestBuffer[Vertex2GlobalIndex+1],MeshPositionRestBuffer[Vertex2GlobalIndex+2]);
+	
+    // Gen the transform from guide vertex Model Space to RootTriangle Local Space
+	RestTriangle.E0 = RestTriangle.P1 - RestTriangle.P0;
+	RestTriangle.E1 = RestTriangle.P2 - RestTriangle.P0;
+	RestTriangle.N = normalize(cross(RestTriangle.E1, RestTriangle.E0));
+	RestTriangle.E0 = normalize(RestTriangle.E0);
+	RestTriangle.E1 = normalize(cross(RestTriangle.E0, RestTriangle.N));
+	
+	float3 RestLocalVertexPos = ToTriangleLocal(VertexPos,Bary,RestTriangle);
+
+    // Get the Deformed RootTriangle pos
+	uint Vertex0LocalIndex = 3*Info.Vertex0Index;
+	uint Vertex1LocalIndex = 3*Info.Vertex1Index;
+	uint Vertex2LocalIndex = 3*Info.Vertex2Index;
+	FMTMeshTriangle DeformedTriangle;
+	DeformedTriangle.P0 = float3(MeshPositionDeformedBuffer[Vertex0LocalIndex],MeshPositionDeformedBuffer[Vertex0LocalIndex+1],MeshPositionDeformedBuffer[Vertex0LocalIndex+2]);
+	DeformedTriangle.P1 = float3(MeshPositionDeformedBuffer[Vertex1LocalIndex],MeshPositionDeformedBuffer[Vertex1LocalIndex+1],MeshPositionDeformedBuffer[Vertex1LocalIndex+2]);
+	DeformedTriangle.P2 = float3(MeshPositionDeformedBuffer[Vertex2LocalIndex],MeshPositionDeformedBuffer[Vertex2LocalIndex+1],MeshPositionDeformedBuffer[Vertex2LocalIndex+2]);
+
+    // Gen the transform from RootTriangle Local Space to World Space
+	DeformedTriangle.E0 = DeformedTriangle.P1 - DeformedTriangle.P0;
+	DeformedTriangle.E1 = DeformedTriangle.P2 - DeformedTriangle.P0;
+	DeformedTriangle.N = normalize(cross(DeformedTriangle.E1, DeformedTriangle.E0));
+	DeformedTriangle.E0 = normalize(DeformedTriangle.E0);
+	DeformedTriangle.E1 = normalize(cross(DeformedTriangle.E0, DeformedTriangle.N));
+	
+    // transform vertex pos from guide vertex Model Space to World Space
+	float3 DeformedWorldVertexPos = ToTriangleWorld(RestLocalVertexPos,Bary,DeformedTriangle);
+	
+	DeformedWorldVertexPos = mul(float4(DeformedWorldVertexPos,1),CompToWorld).xyz;
+
+
+    return DeformedWorldVertexPos;
+}
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void IntegrationAndGlobalShapeConstraintsMT(uint GIndex : SV_GroupIndex,
+                  uint3 GId : SV_GroupID,
+                  uint3 DTid : SV_DispatchThreadID)
+{
+    uint GlobalStrandIndex, LocalStrandIndex, GlobalVertexIndex, LocalVertexIndex, NumVerticesInTheStrand, IndexForSharedMem, StrandType;
+    CalcIndicesInVertexLevelMaster(GIndex, GId.x, GlobalStrandIndex, LocalStrandIndex, GlobalVertexIndex, LocalVertexIndex, NumVerticesInTheStrand, IndexForSharedMem, StrandType);
+
+	uint4 PackedRestPosition = GuidesRestPositionBuffer[GlobalVertexIndex];
+	float3 RestPos = f16tof32(PackedRestPosition.xyz) + GuidesRestPositionOffset;
+	const uint ControlChannel = asuint(PackedRestPosition.w);
+
+	FBoneIndexData IndexData = GuidesBoneIndexBuffer[GlobalStrandIndex];
+	
+	float3 InitialPos = ApplyBlendShapeSkinning(RestPos,GlobalStrandIndex);
+	
+    // position when this step starts. In other words, a position from the last step.
+    float4 CurrentPos = GuidesDeformedPositionBuffer[GlobalVertexIndex];
+
+	
+    // Integrate
+    float4 OldPos;
+    OldPos = GuidesDeformedPrevPositionBuffer[GlobalVertexIndex];
+	
+	if ( ResetPositions != 0.0f )
+	{
+		CurrentPos.xyz = InitialPos;
+		OldPos.xyz = InitialPos;
+	}
+	
+    float4 Force = float4(0, 0, 0, 0);
+	float4 TempPos;
+	if ( IsMovable(ControlChannel) )
+        TempPos = Integrate(CurrentPos, OldPos, Force);
+    else
+        TempPos = float4(InitialPos,0);
+
+	// Global Shape Constraints
+	if(GlobalShapeStiffness > 0 && GlobalShapeEffectiveRange > 0)
+	{
+        if ( IsMovable(ControlChannel) )
+        {
+            if ( (float)LocalVertexIndex < GlobalShapeEffectiveRange * (float)NumVerticesInTheStrand )
+            {
+                float3 Del = GlobalShapeStiffness * (InitialPos - TempPos.xyz);
+                TempPos.xyz += Del;
+            }
+        }
+	}
+
+	// update global position buffers
+	UpdateFinalVertexPositions(CurrentPos, float4(TempPos.xyz,asfloat(PackedRestPosition.w)), GlobalVertexIndex, LocalVertexIndex, NumVerticesInTheStrand);
+}
+

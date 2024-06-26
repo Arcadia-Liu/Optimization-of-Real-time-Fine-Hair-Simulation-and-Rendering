@@ -1,0 +1,66 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+#pragma once
+
+
+struct FTressFXAverageEnergy
+{
+	float3 A_R;
+	float3 A_TT;
+	float3 A_TRT;
+};
+
+struct FTressFXAverageScattering
+{
+	float3 A_front;	// Front Scattering A_f
+	float3 A_back;	// Back Scattering A_b
+};
+
+float3 FromLinearAbsorptionTFX(float3 In) { return sqrt(In);  }
+float3 ToLinearAbsorptionTFX(float3 In) { return In*In; }
+
+FTressFXAverageScattering SampleTressFXLUT(Texture3D<float4> LUTTexture, SamplerState LUTSampler, float3 InAbsorption, float Roughness, float SinViewAngle)
+{
+	const float3 RemappedAbsorption = FromLinearAbsorptionTFX(InAbsorption);
+	const float2 LUTValue_R = LUTTexture.SampleLevel(LUTSampler, float3(saturate(abs(SinViewAngle)), saturate(Roughness), saturate(RemappedAbsorption.x)), 0).xy;
+	const float2 LUTValue_G = LUTTexture.SampleLevel(LUTSampler, float3(saturate(abs(SinViewAngle)), saturate(Roughness), saturate(RemappedAbsorption.y)), 0).xy;
+	const float2 LUTValue_B = LUTTexture.SampleLevel(LUTSampler, float3(saturate(abs(SinViewAngle)), saturate(Roughness), saturate(RemappedAbsorption.z)), 0).xy;
+
+	FTressFXAverageScattering Output;
+	Output.A_front = float3(LUTValue_R.x, LUTValue_G.x, LUTValue_B.x);
+	Output.A_back  = float3(LUTValue_R.y, LUTValue_G.y, LUTValue_B.y);
+	return Output;
+}
+
+FTressFXAverageEnergy SampleTressFXEnergyLUT(Texture3D<float4> LUTTexture, SamplerState LUTSampler, float3 InAbsorption, float Roughness, float SinViewAngle)
+{
+	const float3 RemappedAbsorption = FromLinearAbsorptionTFX(InAbsorption);
+	const float3 LUTValue_R = LUTTexture.SampleLevel(LUTSampler, float3(saturate(abs(SinViewAngle)), saturate(Roughness), saturate(RemappedAbsorption.x)), 0).xyz;
+	const float3 LUTValue_G = LUTTexture.SampleLevel(LUTSampler, float3(saturate(abs(SinViewAngle)), saturate(Roughness), saturate(RemappedAbsorption.y)), 0).xyz;
+	const float3 LUTValue_B = LUTTexture.SampleLevel(LUTSampler, float3(saturate(abs(SinViewAngle)), saturate(Roughness), saturate(RemappedAbsorption.z)), 0).xyz;
+
+	FTressFXAverageEnergy Output;
+	Output.A_R = float3(LUTValue_R.x, LUTValue_G.x, LUTValue_B.x);
+	Output.A_TT = float3(LUTValue_R.y, LUTValue_G.y, LUTValue_B.y);
+	Output.A_TRT = float3(LUTValue_R.z, LUTValue_G.z, LUTValue_B.z);
+	return Output;
+}

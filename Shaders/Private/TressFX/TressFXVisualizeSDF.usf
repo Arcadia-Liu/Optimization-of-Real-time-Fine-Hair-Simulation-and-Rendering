@@ -1,0 +1,411 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+
+#include "../Common.ush"
+
+//-----------Collision Mesh-------------------
+
+struct FTressFXMeshVertexData
+{
+	float4 Position;
+	float4 Normal;
+};
+StructuredBuffer<FTressFXMeshVertexData>		MeshVertexBuffer;
+
+struct FTressFXVisualizeSDFMeshVSToPS
+{
+	float4 SvPosition : SV_POSITION;
+	float4 Color : TEXCOORD0;
+};
+
+void MeshMainVS(
+	uint VertexID : SV_VertexID,
+	out FTressFXVisualizeSDFMeshVSToPS Output)
+{
+	float3 VertexPos = MeshVertexBuffer[VertexID].Position.xyz;
+	
+	Output.SvPosition = mul(float4(VertexPos,1),View.WorldToClip);
+	
+	Output.Color = float4(0,1,1,0);
+}
+
+void MeshMainPS(
+	FTressFXVisualizeSDFMeshVSToPS Input,
+	out float4 OutColor : SV_Target0
+	)
+{
+	//
+	OutColor = Input.Color;
+}
+
+//----------Collision Mesh AABB-------------
+
+struct FCollisionMeshBox
+{
+	float4 Min;
+	float4 Max;
+	float4 CellSize;
+};
+StructuredBuffer<FCollisionMeshBox> CMBoxBuffer;
+
+struct FTressFXVisualizeSDFMeshAABBVSToGS
+{
+	uint VertexID : TEXCOORD0;
+};
+
+struct FTressFXVisualizeSDFMeshAABBGSToPS
+{
+	float4 SvPosition : SV_POSITION;
+	float4 Color : TEXCOORD0;
+};
+
+void MeshAABBMainVS(
+	uint VertexID : SV_VertexID,
+	out FTressFXVisualizeSDFMeshAABBVSToGS Output)
+{
+	Output.VertexID = VertexID;
+}
+
+[maxvertexcount(36)]
+void MeshAABBMainGS(point FTressFXVisualizeSDFMeshAABBVSToGS Input[1], inout LineStream<FTressFXVisualizeSDFMeshAABBGSToPS> OutStream)
+{
+	uint VertexID = Input[0].VertexID;
+
+	FCollisionMeshBox MeshBox = CMBoxBuffer[VertexID];
+
+	{
+		float3 VoxelCenter = (MeshBox.Min.xyz+MeshBox.Max.xyz)*0.5;
+		float4 SvBottomVertex[4];
+		float4 SvTopVertex[4];
+
+		float3 Step = 0.5*(MeshBox.Max.xyz-MeshBox.Min.xyz);
+
+		SvBottomVertex[0] = mul(float4(VoxelCenter + float3(-Step.x,-Step.y,-Step.z),1),View.WorldToClip);
+		SvBottomVertex[1] = mul(float4(VoxelCenter + float3(Step.x,-Step.y,-Step.z),1),View.WorldToClip);
+		SvBottomVertex[2] = mul(float4(VoxelCenter + float3(Step.x,Step.y,-Step.z),1),View.WorldToClip);
+		SvBottomVertex[3] = mul(float4(VoxelCenter + float3(-Step.x,Step.y,-Step.z),1),View.WorldToClip);
+		
+		SvTopVertex[0] = mul(float4(VoxelCenter + float3(-Step.x,-Step.y,Step.z),1),View.WorldToClip);
+		SvTopVertex[1] = mul(float4(VoxelCenter + float3(Step.x,-Step.y,Step.z),1),View.WorldToClip);
+		SvTopVertex[2] = mul(float4(VoxelCenter + float3(Step.x,Step.y,Step.z),1),View.WorldToClip);
+		SvTopVertex[3] = mul(float4(VoxelCenter + float3(-Step.x,Step.y,Step.z),1),View.WorldToClip);
+	
+
+		FTressFXVisualizeSDFMeshAABBGSToPS Output;
+		Output.Color = float4(1,1,1,1);
+		
+		//Line01
+		Output.SvPosition = SvBottomVertex[0];
+		OutStream.Append(Output);
+		Output.SvPosition = SvBottomVertex[1];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line02
+		Output.SvPosition = SvBottomVertex[1];
+		OutStream.Append(Output);
+		Output.SvPosition = SvBottomVertex[2];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line03
+		Output.SvPosition = SvBottomVertex[2];
+		OutStream.Append(Output);
+		Output.SvPosition = SvBottomVertex[3];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line04
+		Output.SvPosition = SvBottomVertex[3];
+		OutStream.Append(Output);
+		Output.SvPosition = SvBottomVertex[0];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+				
+		//Line05
+		Output.SvPosition = SvTopVertex[0];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[1];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line06
+		Output.SvPosition = SvTopVertex[1];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[2];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line07
+		Output.SvPosition = SvTopVertex[2];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[3];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line08
+		Output.SvPosition = SvTopVertex[3];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[0];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+				
+		//Line09
+		Output.SvPosition = SvBottomVertex[0];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[0];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line10
+		Output.SvPosition = SvBottomVertex[1];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[1];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line11
+		Output.SvPosition = SvBottomVertex[2];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[2];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line12
+		Output.SvPosition = SvBottomVertex[3];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[3];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+	}
+}
+
+void MeshAABBMainPS(
+	FTressFXVisualizeSDFMeshAABBGSToPS Input,
+	out float4 OutColor : SV_Target0
+	)
+{
+	//
+	OutColor = Input.Color;
+}
+
+
+//----------SDF--------------------
+
+int3 NumSDFCells;
+
+StructuredBuffer<uint> SDFBufferR;
+
+StructuredBuffer<uint> SDFDirectionStartOffsetBufferR;
+
+struct FDirectionAndCellIndex
+{
+	float3 Direction;
+	float Distance;
+	uint CellIndex;
+	uint Next;
+};
+StructuredBuffer<FDirectionAndCellIndex> SDFDirectionBufferR;
+
+
+struct FTressFXVisualizeSDFVSToGS
+{
+	uint VertexID : TEXCOORD0;
+};
+
+struct FTressFXVisualizeSDFGSToPS
+{
+	float4 SvPosition : SV_POSITION;
+	float4 Color : TEXCOORD0;
+};
+
+void SDFMainVS(
+	uint VertexID : SV_VertexID,
+	out FTressFXVisualizeSDFVSToGS Output)
+{
+	Output.VertexID = VertexID;
+}
+
+[maxvertexcount(36)]
+void SDFMainGS(point FTressFXVisualizeSDFVSToGS Input[1], inout LineStream<FTressFXVisualizeSDFGSToPS> OutStream)
+{
+	uint VertexID = Input[0].VertexID;
+	
+	uint X = VertexID % NumSDFCells.x;
+	uint Y = VertexID % (NumSDFCells.x*NumSDFCells.y) / NumSDFCells.x;
+	uint Z = VertexID / (NumSDFCells.x*NumSDFCells.y);
+	
+	
+	FCollisionMeshBox MeshBox = CMBoxBuffer[0];
+
+	{
+		float3 Step = 0.5*MeshBox.CellSize.xyz;
+
+		float3 VoxelCenter = MeshBox.Min.xyz + float3(X,Y,Z)*MeshBox.CellSize.xyz+Step;
+		
+		
+		float4 Start;
+		float4 End;
+		float Distance = asfloat(SDFBufferR[VertexID]);
+
+		if(Distance == 1e10f)
+		{
+			OutStream.RestartStrip();
+			return ;
+		}
+
+		uint Offset = SDFDirectionStartOffsetBufferR[VertexID];
+		float3 Dir = -SDFDirectionBufferR[Offset].Direction;
+
+		float Dist = Distance > 0 ? Distance : -Distance;
+
+		Start = mul(float4(VoxelCenter,1),View.WorldToClip);
+		End = mul(float4(VoxelCenter+Dist*Dir,1),View.WorldToClip);
+	
+		
+		float4 SvBottomVertex[4];
+		float4 SvTopVertex[4];
+
+
+		SvBottomVertex[0] = mul(float4(VoxelCenter + float3(-Step.x,-Step.y,-Step.z),1),View.WorldToClip);
+		SvBottomVertex[1] = mul(float4(VoxelCenter + float3(Step.x,-Step.y,-Step.z),1),View.WorldToClip);
+		SvBottomVertex[2] = mul(float4(VoxelCenter + float3(Step.x,Step.y,-Step.z),1),View.WorldToClip);
+		SvBottomVertex[3] = mul(float4(VoxelCenter + float3(-Step.x,Step.y,-Step.z),1),View.WorldToClip);
+		
+		SvTopVertex[0] = mul(float4(VoxelCenter + float3(-Step.x,-Step.y,Step.z),1),View.WorldToClip);
+		SvTopVertex[1] = mul(float4(VoxelCenter + float3(Step.x,-Step.y,Step.z),1),View.WorldToClip);
+		SvTopVertex[2] = mul(float4(VoxelCenter + float3(Step.x,Step.y,Step.z),1),View.WorldToClip);
+		SvTopVertex[3] = mul(float4(VoxelCenter + float3(-Step.x,Step.y,Step.z),1),View.WorldToClip);
+	
+
+		FTressFXVisualizeSDFMeshAABBGSToPS Output;
+		if(Distance < 0)
+			Output.Color = float4(1,0,0,1);
+		else
+			Output.Color = float4(0,0,1,1);
+
+		//Distance
+		Output.SvPosition = Start;
+		OutStream.Append(Output);
+		Output.SvPosition = End;
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+
+
+		Output.Color = float4(1,1,0,1);
+		
+		//Line01
+		Output.SvPosition = SvBottomVertex[0];
+		OutStream.Append(Output);
+		Output.SvPosition = SvBottomVertex[1];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line02
+		Output.SvPosition = SvBottomVertex[1];
+		OutStream.Append(Output);
+		Output.SvPosition = SvBottomVertex[2];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line03
+		Output.SvPosition = SvBottomVertex[2];
+		OutStream.Append(Output);
+		Output.SvPosition = SvBottomVertex[3];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line04
+		Output.SvPosition = SvBottomVertex[3];
+		OutStream.Append(Output);
+		Output.SvPosition = SvBottomVertex[0];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+				
+		//Line05
+		Output.SvPosition = SvTopVertex[0];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[1];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line06
+		Output.SvPosition = SvTopVertex[1];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[2];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line07
+		Output.SvPosition = SvTopVertex[2];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[3];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line08
+		Output.SvPosition = SvTopVertex[3];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[0];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+				
+		//Line09
+		Output.SvPosition = SvBottomVertex[0];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[0];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line10
+		Output.SvPosition = SvBottomVertex[1];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[1];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line11
+		Output.SvPosition = SvBottomVertex[2];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[2];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+		
+		//Line12
+		Output.SvPosition = SvBottomVertex[3];
+		OutStream.Append(Output);
+		Output.SvPosition = SvTopVertex[3];
+		OutStream.Append(Output);
+		OutStream.RestartStrip();
+	}
+}
+
+void SDFMainPS(
+	FTressFXVisualizeSDFGSToPS Input,
+	out float4 OutColor : SV_Target0
+	)
+{
+	//
+	OutColor = Input.Color;
+}

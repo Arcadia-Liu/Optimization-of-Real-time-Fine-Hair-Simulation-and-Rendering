@@ -1,0 +1,81 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "TressFXMaterialCommon.ush"
+
+void Main(
+	in float4 SvPosition: SV_Position
+	, in uint2 Resolution : DISPATCH_RESOLUTION
+	, in uint TotalNodeCount : DISPATCH_NODE_COUNT
+	#if HAIR_MATERIAL_DEBUG_OR_EMISSIVE_OUTPUT
+	, out float4 OutColor0 : SV_Target0
+	#endif
+	)
+{
+	ResolvedView = ResolveView();
+
+	const uint3 PixelCoord = uint3(floor(SvPosition.xy), 0);
+	const uint SampleIndex = PixelCoord.x + PixelCoord.y * Resolution.x;// MaterialPassTFXParameters.MaxResolution.x;
+	bool bIsValid = false;
+	float3 Emissive = 0;
+	if (SampleIndex < TotalNodeCount)
+	{
+		const FNodeVisTFX InNode = MaterialPassTFXParameters.NodeVis[SampleIndex];
+		
+		const uint PackedSamplePixelCoord = MaterialPassTFXParameters.NodeCoord[SampleIndex];
+		const float2 SamplePixelCoord = float2(PackedSamplePixelCoord & 0xFFFF, (PackedSamplePixelCoord>>16) & 0xFFFF) + float2(0.5f, 0.5f);
+
+		float SampleDepth = InNode.Depth;
+		uint SampleCoverage8bit = InNode.Coverage8bit;
+		uint SamplePrimitiveId = InNode.PrimitiveId;
+		uint SampleMaterialId = InNode.MaterialId;
+
+		if (SampleMaterialId == MaterialPass_MaterialId)
+		{
+			FEvaluateOutputTFX Out = EvaluateTFX(SamplePixelCoord, SampleDepth, SamplePrimitiveId, SampleCoverage8bit, MaterialPass_PrimitiveId, MaterialPassTFXParameters.bUpdateSampleCoverage > 0);
+
+			// Note: Use the syntax _ over the syntax . as on certain platform the UAV buffers are 
+			// stored within a static const struct preventing doing a write operation
+			//
+			// Original code:
+			// MaterialPassTFXParameters.OutNodeData[SampleIndex] = PackTressFXSample(Out.NodeData);
+			// MaterialPassTFXParameters.OutNodeVelocity[SampleIndex] = Out.NodeVelocity;
+			MaterialPassTFXParameters_OutNodeData[SampleIndex] = PackTressFXSample(Out.NodeData);
+			MaterialPassTFXParameters_OutNodeVelocity[SampleIndex] = Out.NodeVelocity;//
+
+			bIsValid = true;
+			Emissive = Out.NodeData.Emissive * float(Out.NodeData.Coverage8bit / 255.f);
+		}
+	}
+
+	#if HAIR_MATERIAL_DEBUG_OR_EMISSIVE_OUTPUT
+	if (MaterialPassTFXParameters.bOutputEmissive > 0)
+	{
+		OutColor0 = float4(Emissive,1);
+	}
+	else
+	{	
+		OutColor0 = bIsValid ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
+	}
+	#endif
+}

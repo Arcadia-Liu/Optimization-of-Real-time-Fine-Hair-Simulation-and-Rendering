@@ -1,0 +1,360 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "../Common.ush"
+#include "TressFXSimulationSDFCommon.ush"
+
+
+uint FloatFlip(float fl)
+{
+	uint f = asuint(fl);
+	return f ^ 0x80000000;
+}
+
+struct FTressFXMeshVertexData
+{
+	float4 Position;
+	float4 Normal;
+};
+StructuredBuffer<FTressFXMeshVertexData>		MeshRestVertexBuffer;
+
+RWStructuredBuffer<FTressFXMeshVertexData>		MeshDeformedVertexBuffer;
+
+uint NumMeshVertices;
+
+struct FBoneSkinningData
+{
+	uint BoneIndex;  
+	float BoneWeight; 
+};
+
+struct FBoneIndexData
+{
+	uint StartIndex;  
+	uint Count; 
+};
+
+
+StructuredBuffer<FBoneSkinningData> BoneSkinningBuffer;
+StructuredBuffer<FBoneIndexData> BoneIndexBuffer;
+StructuredBuffer<float4> BoneMatricesBuffer;
+
+struct FIntermediateCollisionMeshBox
+{
+	int4 Max;
+	int4 Min;
+};
+
+globallycoherent RWStructuredBuffer<FIntermediateCollisionMeshBox> ICMBox;
+
+groupshared FIntermediateCollisionMeshBox LDS_ICMBox;
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void SDFMeshSkinning(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	uint LocalId = GIndex;
+	uint GroupId = GId.x;
+	uint GlobalId = LocalId + GroupId * THREAD_GROUP_SIZE;
+
+	GlobalId = GlobalId >= NumMeshVertices ? NumMeshVertices-1 : GlobalId;
+
+	float3 Pos = MeshRestVertexBuffer[GlobalId].Position.xyz;
+	float3 N = MeshRestVertexBuffer[GlobalId].Normal.xyz;
+
+	// compute a bone skinning transform
+	FBoneIndexData IndexData = BoneIndexBuffer[GlobalId];
+	FBoneSkinningData SkinningData = BoneSkinningBuffer[IndexData.StartIndex];
+
+	// Interpolate world space bone matrices using weights. 
+	uint BoneIndex = SkinningData.BoneIndex;
+	float4 A = BoneMatricesBuffer[4*BoneIndex];
+	float4 B = BoneMatricesBuffer[4*BoneIndex+1];
+	float4 C = BoneMatricesBuffer[4*BoneIndex+2];
+	float4 D = BoneMatricesBuffer[4*BoneIndex+3];
+    float4x4 BoneMatrix = float4x4(A,B,C,D) * SkinningData.BoneWeight;
+	float WeightSum = SkinningData.BoneWeight;
+
+	// Each vertex gets influence from four bones. In case there are less than four bones, boneIndex and boneWeight would be zero. 
+	// This number four was set in Maya exporter and also used in loader. So it should not be changed unless you have a very strong reason and are willing to go through all spots. 
+	for (int i = 1; i < IndexData.Count; i++)
+	{
+		SkinningData = BoneSkinningBuffer[IndexData.StartIndex+i];
+		if (SkinningData.BoneWeight > 0)
+		{
+			BoneIndex = SkinningData.BoneIndex;
+			A = BoneMatricesBuffer[4*BoneIndex];
+			B = BoneMatricesBuffer[4*BoneIndex+1];
+			C = BoneMatricesBuffer[4*BoneIndex+2];
+			D = BoneMatricesBuffer[4*BoneIndex+3];
+            BoneMatrix += float4x4(A,B,C,D) * SkinningData.BoneWeight;
+			WeightSum += SkinningData.BoneWeight;
+		}
+	}
+
+	BoneMatrix /= WeightSum;
+
+	Pos = mul(float4(Pos, 1), BoneMatrix).xyz;
+	N = mul(float4(N, 0), BoneMatrix).xyz;
+	MeshDeformedVertexBuffer[GlobalId].Position = float4(Pos,0);
+	MeshDeformedVertexBuffer[GlobalId].Normal = float4(N,0);
+
+	if(0 == GIndex)
+	{
+		LDS_ICMBox.Min = int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+		LDS_ICMBox.Max = -int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	int3 IntPos = Pos;
+
+	InterlockedMax(LDS_ICMBox.Max.x,IntPos.x);
+	InterlockedMin(LDS_ICMBox.Min.x,IntPos.x);
+	InterlockedMax(LDS_ICMBox.Max.y,IntPos.y);
+	InterlockedMin(LDS_ICMBox.Min.y,IntPos.y);
+	InterlockedMax(LDS_ICMBox.Max.z,IntPos.z);
+	InterlockedMin(LDS_ICMBox.Min.z,IntPos.z);
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if(0 == GIndex)
+	{
+		InterlockedMax(ICMBox[0].Max.x,LDS_ICMBox.Max.x);
+		InterlockedMin(ICMBox[0].Min.x,LDS_ICMBox.Min.x);
+		InterlockedMax(ICMBox[0].Max.y,LDS_ICMBox.Max.y);
+		InterlockedMin(ICMBox[0].Min.y,LDS_ICMBox.Min.y);
+		InterlockedMax(ICMBox[0].Max.z,LDS_ICMBox.Max.z);
+		InterlockedMin(ICMBox[0].Min.z,LDS_ICMBox.Min.z);
+	}
+
+}
+
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void SDFMeshSkinningNoBone(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	uint LocalId = GIndex;
+	uint GroupId = GId.x;
+	uint GlobalId = LocalId + GroupId * THREAD_GROUP_SIZE;
+
+	GlobalId = GlobalId >= NumMeshVertices ? NumMeshVertices-1 : GlobalId;
+
+	float3 Pos = MeshRestVertexBuffer[GlobalId].Position.xyz;
+
+	if(0 == GIndex)
+	{
+		LDS_ICMBox.Min = int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+		LDS_ICMBox.Max = -int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	
+	int3 IntPos = Pos;
+
+	InterlockedMax(LDS_ICMBox.Max.x,IntPos.x);
+	InterlockedMin(LDS_ICMBox.Min.x,IntPos.x);
+	InterlockedMax(LDS_ICMBox.Max.y,IntPos.y);
+	InterlockedMin(LDS_ICMBox.Min.y,IntPos.y);
+	InterlockedMax(LDS_ICMBox.Max.z,IntPos.z);
+	InterlockedMin(LDS_ICMBox.Min.z,IntPos.z);
+
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if(0 == GIndex)
+	{
+		InterlockedMax(ICMBox[0].Max.x,LDS_ICMBox.Max.x);
+		InterlockedMin(ICMBox[0].Min.x,LDS_ICMBox.Min.x);
+		InterlockedMax(ICMBox[0].Max.y,LDS_ICMBox.Max.y);
+		InterlockedMin(ICMBox[0].Min.y,LDS_ICMBox.Min.y);
+		InterlockedMax(ICMBox[0].Max.z,LDS_ICMBox.Max.z);
+		InterlockedMin(ICMBox[0].Min.z,LDS_ICMBox.Min.z);
+	}
+
+}
+
+/*
+// Compute float AABB
+
+struct FIntermediateCollisionMeshBox
+{
+	uint4 PositiveMin;
+	uint4 NegativeMin;
+	uint4 PositiveMax;
+	uint4 NegativeMax;
+};
+
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void SDFMeshSkinning(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	uint LocalId = GIndex;
+	uint GroupId = GId.x;
+	uint GlobalId = LocalId + GroupId * THREAD_GROUP_SIZE;
+
+	GlobalId = GlobalId >= NumMeshVertices ? NumMeshVertices-1 : GlobalId;
+
+	float3 Pos = MeshRestVertexBuffer[GlobalId].Position.xyz;
+	float3 N = MeshRestVertexBuffer[GlobalId].Normal.xyz;
+
+	// compute a bone skinning transform
+	FBoneSkinningData SkinningData = BoneSkinningBuffer[GlobalId];
+
+	// Interpolate world space bone matrices using weights. 
+	uint BoneIndex = SkinningData.BoneIndex[0];
+	float4 A = BoneMatricesBuffer[4*BoneIndex];
+	float4 B = BoneMatricesBuffer[4*BoneIndex+1];
+	float4 C = BoneMatricesBuffer[4*BoneIndex+2];
+	float4 D = BoneMatricesBuffer[4*BoneIndex+3];
+    float4x4 BoneMatrix = float4x4(A,B,C,D) * SkinningData.BoneWeight[0];
+	float WeightSum = SkinningData.BoneWeight[0];
+
+	// Each vertex gets influence from four bones. In case there are less than four bones, boneIndex and boneWeight would be zero. 
+	// This number four was set in Maya exporter and also used in loader. So it should not be changed unless you have a very strong reason and are willing to go through all spots. 
+	for (int i = 1; i < 4; i++)
+	{
+		if (SkinningData.BoneWeight[i] > 0)
+		{
+			BoneIndex = SkinningData.BoneIndex[i];
+			A = BoneMatricesBuffer[4*BoneIndex];
+			B = BoneMatricesBuffer[4*BoneIndex+1];
+			C = BoneMatricesBuffer[4*BoneIndex+2];
+			D = BoneMatricesBuffer[4*BoneIndex+3];
+            BoneMatrix += float4x4(A,B,C,D) * SkinningData.BoneWeight[i];
+			WeightSum += SkinningData.BoneWeight[i];
+		}
+	}
+
+	BoneMatrix /= WeightSum;
+
+	Pos = mul(float4(Pos, 1), BoneMatrix).xyz;
+	N = mul(float4(N, 0), BoneMatrix).xyz;
+	MeshDeformedVertexBuffer[GlobalId].Position = float4(Pos,0);
+	MeshDeformedVertexBuffer[GlobalId].Normal = float4(N,0);
+
+	if(0 == GIndex)
+	{
+		LDS_ICMBox.PositiveMin = uint4(0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0);
+		LDS_ICMBox.NegativeMin = uint4(0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0);
+		LDS_ICMBox.PositiveMax = uint4(0,0,0,0);
+		LDS_ICMBox.NegativeMax = uint4(0,0,0,0);
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	InterlockedMax(LDS_ICMBox.NegativeMax.x,Pos.x > 0 ? 0 : asuint(Pos.x));
+	InterlockedMax(LDS_ICMBox.PositiveMax.x,Pos.x < 0 ? 0 : asuint(Pos.x));
+	InterlockedMin(LDS_ICMBox.PositiveMin.x,Pos.x < 0 ? 0xFFFFFFFF : asuint(Pos.x));
+	InterlockedMin(LDS_ICMBox.NegativeMin.x,Pos.x > 0 ? 0xFFFFFFFF : asuint(Pos.x));
+	InterlockedMax(LDS_ICMBox.NegativeMax.y,Pos.y > 0 ? 0 : asuint(Pos.y));
+	InterlockedMax(LDS_ICMBox.PositiveMax.y,Pos.y < 0 ? 0 : asuint(Pos.y));
+	InterlockedMin(LDS_ICMBox.PositiveMin.y,Pos.y < 0 ? 0xFFFFFFFF : asuint(Pos.y));
+	InterlockedMin(LDS_ICMBox.NegativeMin.y,Pos.y > 0 ? 0xFFFFFFFF : asuint(Pos.y));
+	InterlockedMax(LDS_ICMBox.NegativeMax.z,Pos.z > 0 ? 0 : asuint(Pos.z));
+	InterlockedMax(LDS_ICMBox.PositiveMax.z,Pos.z < 0 ? 0 : asuint(Pos.z));
+	InterlockedMin(LDS_ICMBox.PositiveMin.z,Pos.z < 0 ? 0xFFFFFFFF : asuint(Pos.z));
+	InterlockedMin(LDS_ICMBox.NegativeMin.z,Pos.z > 0 ? 0xFFFFFFFF : asuint(Pos.z));
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if(0 == GIndex)
+	{
+		InterlockedMax(ICMBox[0].NegativeMax.x,asfloat(LDS_ICMBox.NegativeMax.x) > 0 ? 0 : LDS_ICMBox.NegativeMax.x);
+		InterlockedMax(ICMBox[0].PositiveMax.x,asfloat(LDS_ICMBox.PositiveMax.x) < 0 ? 0 : LDS_ICMBox.PositiveMax.x);
+		InterlockedMin(ICMBox[0].PositiveMin.x,asfloat(LDS_ICMBox.PositiveMin.x) < 0 ? 0xFFFFFFFF : LDS_ICMBox.PositiveMin.x);
+		InterlockedMin(ICMBox[0].NegativeMin.x,asfloat(LDS_ICMBox.NegativeMin.x) > 0 ? 0xFFFFFFFF : LDS_ICMBox.NegativeMin.x);
+		InterlockedMax(ICMBox[0].NegativeMax.y,asfloat(LDS_ICMBox.NegativeMax.y) > 0 ? 0 : LDS_ICMBox.NegativeMax.y);
+		InterlockedMax(ICMBox[0].PositiveMax.y,asfloat(LDS_ICMBox.PositiveMax.y) < 0 ? 0 : LDS_ICMBox.PositiveMax.y);
+		InterlockedMin(ICMBox[0].PositiveMin.y,asfloat(LDS_ICMBox.PositiveMin.y) < 0 ? 0xFFFFFFFF : LDS_ICMBox.PositiveMin.y);
+		InterlockedMin(ICMBox[0].NegativeMin.y,asfloat(LDS_ICMBox.NegativeMin.y) > 0 ? 0xFFFFFFFF : LDS_ICMBox.NegativeMin.y);
+		InterlockedMax(ICMBox[0].NegativeMax.z,asfloat(LDS_ICMBox.NegativeMax.z) > 0 ? 0 : LDS_ICMBox.NegativeMax.z);
+		InterlockedMax(ICMBox[0].PositiveMax.z,asfloat(LDS_ICMBox.PositiveMax.z) < 0 ? 0 : LDS_ICMBox.PositiveMax.z);
+		InterlockedMin(ICMBox[0].PositiveMin.z,asfloat(LDS_ICMBox.PositiveMin.z) < 0 ? 0xFFFFFFFF : LDS_ICMBox.PositiveMin.z);
+		InterlockedMin(ICMBox[0].NegativeMin.z,asfloat(LDS_ICMBox.NegativeMin.z) > 0 ? 0xFFFFFFFF : LDS_ICMBox.NegativeMin.z);
+	}
+
+}
+
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void SDFMeshSkinningNoBone(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	uint LocalId = GIndex;
+	uint GroupId = GId.x;
+	uint GlobalId = LocalId + GroupId * THREAD_GROUP_SIZE;
+
+	GlobalId = GlobalId >= NumMeshVertices ? NumMeshVertices-1 : GlobalId;
+
+	float3 Pos = MeshRestVertexBuffer[GlobalId].Position.xyz;
+
+	if(0 == GIndex)
+	{
+		LDS_ICMBox.PositiveMin = uint4(0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0);
+		LDS_ICMBox.NegativeMin = uint4(0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0);
+		LDS_ICMBox.PositiveMax = uint4(0,0,0,0);
+		LDS_ICMBox.NegativeMax = uint4(0,0,0,0);
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	InterlockedMax(LDS_ICMBox.NegativeMax.x,Pos.x > 0 ? 0 : asuint(Pos.x));
+	InterlockedMax(LDS_ICMBox.PositiveMax.x,Pos.x < 0 ? 0 : asuint(Pos.x));
+	InterlockedMin(LDS_ICMBox.PositiveMin.x,Pos.x < 0 ? 0xFFFFFFFF : asuint(Pos.x));
+	InterlockedMin(LDS_ICMBox.NegativeMin.x,Pos.x > 0 ? 0xFFFFFFFF : asuint(Pos.x));
+	InterlockedMax(LDS_ICMBox.NegativeMax.y,Pos.y > 0 ? 0 : asuint(Pos.y));
+	InterlockedMax(LDS_ICMBox.PositiveMax.y,Pos.y < 0 ? 0 : asuint(Pos.y));
+	InterlockedMin(LDS_ICMBox.PositiveMin.y,Pos.y < 0 ? 0xFFFFFFFF : asuint(Pos.y));
+	InterlockedMin(LDS_ICMBox.NegativeMin.y,Pos.y > 0 ? 0xFFFFFFFF : asuint(Pos.y));
+	InterlockedMax(LDS_ICMBox.NegativeMax.z,Pos.z > 0 ? 0 : asuint(Pos.z));
+	InterlockedMax(LDS_ICMBox.PositiveMax.z,Pos.z < 0 ? 0 : asuint(Pos.z));
+	InterlockedMin(LDS_ICMBox.PositiveMin.z,Pos.z < 0 ? 0xFFFFFFFF : asuint(Pos.z));
+	InterlockedMin(LDS_ICMBox.NegativeMin.z,Pos.z > 0 ? 0xFFFFFFFF : asuint(Pos.z));
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if(0 == GIndex)
+	{
+		InterlockedMax(ICMBox[0].NegativeMax.x,asfloat(LDS_ICMBox.NegativeMax.x) > 0 ? 0 : LDS_ICMBox.NegativeMax.x);
+		InterlockedMax(ICMBox[0].PositiveMax.x,asfloat(LDS_ICMBox.PositiveMax.x) < 0 ? 0 : LDS_ICMBox.PositiveMax.x);
+		InterlockedMin(ICMBox[0].PositiveMin.x,asfloat(LDS_ICMBox.PositiveMin.x) < 0 ? 0xFFFFFFFF : LDS_ICMBox.PositiveMin.x);
+		InterlockedMin(ICMBox[0].NegativeMin.x,asfloat(LDS_ICMBox.NegativeMin.x) > 0 ? 0xFFFFFFFF : LDS_ICMBox.NegativeMin.x);
+		InterlockedMax(ICMBox[0].NegativeMax.y,asfloat(LDS_ICMBox.NegativeMax.y) > 0 ? 0 : LDS_ICMBox.NegativeMax.y);
+		InterlockedMax(ICMBox[0].PositiveMax.y,asfloat(LDS_ICMBox.PositiveMax.y) < 0 ? 0 : LDS_ICMBox.PositiveMax.y);
+		InterlockedMin(ICMBox[0].PositiveMin.y,asfloat(LDS_ICMBox.PositiveMin.y) < 0 ? 0xFFFFFFFF : LDS_ICMBox.PositiveMin.y);
+		InterlockedMin(ICMBox[0].NegativeMin.y,asfloat(LDS_ICMBox.NegativeMin.y) > 0 ? 0xFFFFFFFF : LDS_ICMBox.NegativeMin.y);
+		InterlockedMax(ICMBox[0].NegativeMax.z,asfloat(LDS_ICMBox.NegativeMax.z) > 0 ? 0 : LDS_ICMBox.NegativeMax.z);
+		InterlockedMax(ICMBox[0].PositiveMax.z,asfloat(LDS_ICMBox.PositiveMax.z) < 0 ? 0 : LDS_ICMBox.PositiveMax.z);
+		InterlockedMin(ICMBox[0].PositiveMin.z,asfloat(LDS_ICMBox.PositiveMin.z) < 0 ? 0xFFFFFFFF : LDS_ICMBox.PositiveMin.z);
+		InterlockedMin(ICMBox[0].NegativeMin.z,asfloat(LDS_ICMBox.NegativeMin.z) > 0 ? 0xFFFFFFFF : LDS_ICMBox.NegativeMin.z);
+	}
+
+}
+*/

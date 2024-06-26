@@ -1,0 +1,265 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+
+#include "../Common.ush"
+
+#include "TressFXAABBCommon.ush"
+#include "TressFXClusterCommon.ush"
+
+
+uint DivideAndRoundUp(uint Dividend, uint Divisor)
+{
+	return (Dividend + Divisor - 1) / Divisor;
+}
+
+/// Reset indirect buffer args
+#ifdef SHADER_GROUPCULLINGINDCLEAR  
+
+//RWBuffer<uint> DispatchIndirectParametersClusterCount;
+RWBuffer<uint> DrawIndirectParameters; 
+uint VertexCountPerInstance;
+
+[numthreads(1, 1, 1)]
+void MainGroupCullingIndClearCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+#if PERMUTATION_SETINDIRECTDRAW
+	DrawIndirectParameters[0] = VertexCountPerInstance;
+	DrawIndirectParameters[1] = 1;	// 1 instance
+	DrawIndirectParameters[2] = 0;
+	DrawIndirectParameters[3] = 0;
+#else
+	if (DispatchThreadId.x==0)
+	{
+//		DispatchIndirectParametersClusterCount[0] = 0;
+//		DispatchIndirectParametersClusterCount[1] = 1;
+//		DispatchIndirectParametersClusterCount[2] = 1;
+
+		DrawIndirectParameters[0] = 0;	// 0 vertex (to be accumulated)
+		DrawIndirectParameters[1] = 1;	// 1 instance
+		DrawIndirectParameters[2] = 0;
+		DrawIndirectParameters[3] = 0;
+	}
+#endif
+}
+
+#endif
+
+
+uint ClusterCount;
+
+/// 0. Cluster culling  and LOD selection
+#ifdef SHADER_GROUPCULLING
+
+uint NumFollowStrands;
+uint NumVertexCount;
+//StructuredBuffer<FPackedTressFXClusterLODInfo> ClusterLODInfoBuffer; 
+
+RWBuffer<uint> DrawIndirectParameters; 
+
+
+[numthreads(64, 1, 1)]
+void MainGroupCullingCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint ClusterId = DispatchThreadId.x;
+	if (ClusterId < ClusterCount)
+	{
+		//
+		
+		//const FTressFXClusterInfo ClusterInfo = UnpackTressFXClusterInfo(ClusterInfoBuffer[ClusterId]);
+		//FPackedTressFXClusterLODInfo ClusterLOD = ClusterLODInfoBuffer[ClusterId];
+
+		InterlockedAdd(DrawIndirectParameters[0], NumVertexCount * 6 * (NumFollowStrands+1)/*, PreviousVertexCount*/);
+		//if(0 == ClusterId)
+			//DrawIndirectParameters[0] = 60000;
+	}
+}
+
+#endif
+
+
+/// 0. Indirect dispatch buffer preparation for compute raster visibility pass
+#ifdef SHADER_PREPAREINDIRECTDISPATCH
+
+RWBuffer<uint> DrawIndirectBuffer; 
+RWBuffer<uint> DispatchIndirectBuffer; 
+
+[numthreads(1, 1, 1)]
+void MainGroupCullingPrepareIndirectDispatchCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID, 
+	uint3 GroupId : SV_GroupID, 
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	if (GroupId.x == 0 && GroupThreadId.x == 0)
+	{
+		// See TressFXVisibilityRasterCompute.usf
+		const uint RasterComputeGroupSize = 32;
+		const uint RasterComputeGroupCountX = 16;
+
+		// DrawIndirectBuffer contains the total number of vertex count needed for drawing quad triangle strips, so 6 vertices per quad / control point
+		const uint VertexCount    = DrawIndirectBuffer[0];
+		const uint ControlPoint   = VertexCount / 6;
+		const uint DispatchCount  = DivideAndRoundUp(ControlPoint, RasterComputeGroupSize);
+		const uint DispatchCountX = DispatchCount >= RasterComputeGroupCountX ? RasterComputeGroupCountX : (DispatchCount % RasterComputeGroupCountX);
+		const uint DispatchCountY = DivideAndRoundUp(DispatchCount, RasterComputeGroupCountX);
+
+		DispatchIndirectBuffer[0] = DispatchCountX;
+		DispatchIndirectBuffer[1] = DispatchCountY;
+		DispatchIndirectBuffer[2] = 1.0;
+		DispatchIndirectBuffer[3] = ControlPoint;
+	}
+}
+
+#endif
+/// Clear Group AABB
+#ifdef SHADER_CLEARGROUPAABB
+
+RWBuffer<int> OutGroupAABBBuffer; 	// Group data packed as {uint3 AABBMin, uint3 AABBMax}
+
+[numthreads(64, 1, 1)]
+void MainClearGroupAABBCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Clear 'group' AABB
+	if (DispatchThreadId.x == 0)
+	{
+		OutGroupAABBBuffer[0] =  2147483647;
+		OutGroupAABBBuffer[1] =  2147483647;
+		OutGroupAABBBuffer[2] =  2147483647;
+		OutGroupAABBBuffer[3] = -2147483647;
+		OutGroupAABBBuffer[4] = -2147483647;
+		OutGroupAABBBuffer[5] = -2147483647;
+	}
+}
+
+#endif
+
+/// Debug draw clusters
+#ifdef SHADER_DRAWDEBUGAABB
+
+#include "../Common.ush"
+#include "../ShaderDrawDebug.ush"
+#include "../ShaderPrintCommon.ush"
+
+#define MODE_CLUSTER	1
+#define MODE_CULLED		2
+#define MODE_LOD		3
+#define MODE_LOD_SIMPLE	4
+
+
+uint HairGroupId;
+int ClusterDebugMode;
+float LODIndex;
+float LODScreenSize;
+
+Buffer<int> GroupAABBBuffer;
+
+
+[numthreads(64, 1, 1)]
+void MainDrawDebugAABBCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x == 0)
+	{
+		const bool bDrawClusterInfo = ClusterDebugMode == MODE_LOD;
+		const float HairGroupHeight = bDrawClusterInfo ? 120.0f : 60.f;
+
+		float2 StartPos = float2(50.0f, 50.0f + float(HairGroupId) * HairGroupHeight) * View.ViewSizeAndInvSize.zw;
+		float2 Pos = StartPos;
+		
+		#if PERMUTATION_DEBUGAABBBUFFER
+		{
+			// Extra new line to seperate from previous block
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+			
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _F_);
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _Z_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+
+			float ScreenSize = 1;
+			/*{
+				const FTressFXAABB Bound = ReadTressFXAABB(0, GroupAABBBuffer);
+
+				const float3 SphereOrigin = (Bound.Min + Bound.Max) * 0.5f;
+				const float  SphereRadius = length(Bound.Max - SphereOrigin);
+				ScreenSize = ComputeBoundsScreenSizeTFX(SphereOrigin, SphereRadius, View.WorldCameraOrigin, View.ViewToClip);
+			}*/
+			Pos = ShaderPrint(Pos, LODScreenSize);
+
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+			
+			// LOD
+			{
+				int LOD = 0;
+				
+				Pos = ShaderPrintSymbol(Pos, _T_);
+				Pos = ShaderPrintSymbol(Pos, _F_);
+				Pos = ShaderPrintSymbol(Pos, _X_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _L_);
+				Pos = ShaderPrintSymbol(Pos, _O_);
+				Pos = ShaderPrintSymbol(Pos, _D_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+				Pos = ShaderPrintSymbol(Pos, _SPC_);
+
+				{
+					Pos = ShaderPrint(Pos, LODIndex);
+				}
+			}
+		}
+		#endif
+	}
+
+}
+
+#endif

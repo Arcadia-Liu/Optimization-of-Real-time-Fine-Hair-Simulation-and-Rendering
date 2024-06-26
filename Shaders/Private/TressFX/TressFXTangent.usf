@@ -1,0 +1,103 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+
+#include "../Common.ush"
+
+uint VertexCount;
+uint DispatchCountX;
+
+Buffer<float4>	 		StrandsDeformedPositionBuffer;
+RWBuffer<float4>		OutputTangentBuffer;
+
+uint			TressFXVF_bIsCullingEnable;
+
+
+#define GROUP_SIZE 64
+
+float4 PackNormal(float3 V, uint A)
+{
+	return float4(clamp(V,float(-1).xxx,float(1).xxx), 1.0f);
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	const int MaxVertexCount = int(VertexCount);
+	const int LastVertexIndex = MaxVertexCount-1;
+	int IndexCurr = DispatchThreadId.x + DispatchThreadId.y * DispatchCountX * GROUP_SIZE;
+	int IndexPrev = clamp(IndexCurr-1, 0, MaxVertexCount-1);
+	int IndexNext = clamp(IndexCurr+1, 0, MaxVertexCount-1);
+	bool bValid = IndexCurr < MaxVertexCount;
+
+	if (IndexCurr < MaxVertexCount)
+	{
+		const float4 DataCurr = StrandsDeformedPositionBuffer[IndexCurr];
+		const float4 DataPrev = StrandsDeformedPositionBuffer[IndexPrev];
+		const float4 DataNext = StrandsDeformedPositionBuffer[IndexNext];
+
+		const float3 PCurr = DataCurr.xyz;
+		float3 PPrev = DataPrev.xyz;
+		float3 PNext = DataNext.xyz;
+
+		// the vertex type
+		const uint TypeCurr = asuint(DataCurr.a) & 0x3;
+		const uint TypePrev = asuint(DataPrev.a) & 0x3;
+		const uint TypeNext = asuint(DataNext.a) & 0x3;
+
+		float3 T0 = 0;
+		const bool bIsPrevValid = (TypePrev == 0 || TypePrev == 1) && (IndexCurr > 0);
+		if (bIsPrevValid)
+		{
+			T0 = normalize(PCurr - PPrev);
+		}
+
+		float3 T1 = 0;
+		const bool bIsNextValid = (TypeNext == 0 || TypeNext == 2) && (IndexCurr < LastVertexIndex);
+		if (bIsNextValid)
+		{
+			T1 = normalize(PNext - PCurr);
+		}
+
+		const float3 T = normalize(T0 + T1);
+
+		const float Norm2 = dot(T, float3(0,0,-1));
+		float3 Right;
+		if (Norm2 > 0e-3f)
+		{
+			Right = normalize(cross(T, float3(0,0,-1)));
+		}
+		else
+		{
+			Right = normalize(cross(T, float3(0,1,0)));
+		}
+
+		// Build ortho basis
+		float3 TangentX = normalize(cross(Right, T));
+		float3 TangentZ = T;
+
+		OutputTangentBuffer[IndexCurr*2]   = PackNormal(TangentX, 0);
+		OutputTangentBuffer[IndexCurr*2+1] = PackNormal(TangentZ, 127);
+	}
+}
+

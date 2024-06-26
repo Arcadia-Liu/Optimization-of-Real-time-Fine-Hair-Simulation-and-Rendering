@@ -1,0 +1,110 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+#include "TressFXVisibilityCommonStruct.ush"
+
+#include "../Common.ush"
+#include "../VelocityCommon.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+#include "TressFXVisibilityCommon.ush" 
+
+
+
+struct FTressFXVisibilityAccumulateVSToPS
+{
+#if HAIR_RENDER_MODE == RENDER_MODE_MSAA_VISIBILITY
+	nointerpolation uint HairPrimitiveId : HAIR_PRIMITIVE_ID;
+#else
+	FVertexFactoryInterpolantsVSToPS FactoryInterpolants;
+#endif
+	float4 Position : SV_POSITION;
+#if HAIR_RENDER_MODE != RENDER_MODE_MSAA_VISIBILITY
+	float WorldStrandRadius : TEXCOORD8;
+#endif
+#if HAIR_RENDER_MODE == RENDER_MODE_MSAA || HAIR_RENDER_MODE == RENDER_MODE_PPLL
+	float4 PackedVelocityA : TEXCOORD9;
+	float4 PackedVelocityC : TEXCOORD12;
+#endif
+};
+
+#define VS_OUTPUT_TYPE FTressFXVisibilityAccumulateVSToPS
+
+
+#if VERTEXSHADER 
+
+void Main(
+	FVertexFactoryInput Input,
+	OPTIONAL_VertexID
+	out VS_OUTPUT_TYPE Output
+)
+{
+	ResolvedView = ResolveView();
+
+	// #hair_todo: This is a hack/quick term solution, in order to generate valide light/view direction in the case of hair strand factory, as this is used for alighning the strand with the view.
+	FVertexFactoryIntermediates VFIntermediates = GetVertexFactoryIntermediates(Input);
+	
+	bool bUseStableRasterization = false;
+#if VF_STRAND_TRESSFX
+	bUseStableRasterization = UseStableRasterization();
+#endif
+
+	// Velocity computation
+	// The velocity is used to adapt/increase the minimum rasterization size in order to avoid aliasing under heavy-motion.
+	// The higher the velocity, the larger a strand becomes.
+	float VelocityScale = 0;
+	const FTressFXRenderInfo HairRenderInfo = GetTressFXRenderInfo(ResolvedView.HairRenderInfo, ResolvedView.HairRenderInfoBits, bUseStableRasterization);
+
+#if VF_STRAND_TRESSFX
+	FTressFXViewInfo HairViewInfo;
+	HairViewInfo.TranslatedWorldCameraOrigin = ResolvedView.TranslatedWorldCameraOrigin;
+	HairViewInfo.ViewForward = ResolvedView.ViewForward;
+	HairViewInfo.RadiusAtDepth1 = lerp(HairRenderInfo.RadiusAtDepth1Primary, HairRenderInfo.RadiusAtDepth1Velocity, VelocityScale);
+	HairViewInfo.bIsOrthoView = HairRenderInfo.bIsOrthoView;
+
+	float4 WorldPosition = VertexFactoryGetWorldPosition(Input, VFIntermediates, HairViewInfo);
+#else
+	float4 WorldPosition = VertexFactoryGetWorldPosition(Input, VFIntermediates);
+#endif
+
+	float3x3 TangentToLocal = VertexFactoryGetTangentToLocal(Input, VFIntermediates);	
+
+	FMaterialVertexParameters VertexParameters = GetMaterialVertexParameters(Input, VFIntermediates, WorldPosition.xyz, TangentToLocal);
+
+	Output.Position = mul(WorldPosition, View.TranslatedWorldToClip);
+
+#if HAIR_RENDER_MODE == RENDER_MODE_MSAA_VISIBILITY
+	Output.HairPrimitiveId = VFIntermediates.HairPrimitiveId;
+#else
+	Output.FactoryInterpolants = VertexFactoryGetInterpolantsVSToPS(Input, VFIntermediates, VertexParameters);
+
+  #ifdef VF_STRAND_TRESSFX
+	Output.WorldStrandRadius = VFIntermediates.HairDimensions.y;
+  #else
+	Output.WorldStrandRadius = 1;
+  #endif
+#endif
+
+	OutputVertexID( Output );
+}
+
+#endif

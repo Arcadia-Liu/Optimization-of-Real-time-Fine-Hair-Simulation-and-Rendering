@@ -1,0 +1,219 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "../Common.ush"
+#include "TressFXVertexFactoryCommon.ush"
+#include "TressFXVisibilityCommon.ush"
+
+
+#define RASTER_PLATFORM 0
+#define RASTER_NVIDIA 1
+#define RASTER_AMD_DX11 2
+#define RASTER_AMD_DX12 3
+
+// Add permutation for AMD/other
+#if PERMUTATION_RASTER_ATOMIC == RASTER_NVIDIA
+#define NV_SHADER_EXTN_SLOT u7
+#include "/Engine/Shared/ThirdParty/NVIDIA/nvHLSLExtns.h"
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_AMD_DX11
+#define AmdDxExtShaderIntrinsicsUAVSlot u7
+#include "/Engine/Shared/ThirdParty/AMD/ags_shader_intrinsics_dx11.h"
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_AMD_DX12
+#include "/Engine/Shared/ThirdParty/AMD/ags_shader_intrinsics_dx12.h"
+#endif
+
+#if PERMUTATION_RASTER_ATOMIC == RASTER_PLATFORM && COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS && COMPILER_SUPPORTS_ULONG_TYPES
+#define PackedType UlongType
+PackedType ToPackedType(uint2 Data)
+{
+	return PackUlongType(Data);
+}
+PackedType NextValue(PackedType In, PackedType Out)
+{
+	return In < Out ? In : Out;
+}
+#else
+#define PackedType uint2
+PackedType ToPackedType(uint2 Data)
+{
+	return Data;
+}
+PackedType NextValue(PackedType In, PackedType Out)
+{
+	return In.y < Out.y ? In : Out;
+}
+#endif
+
+PackedType WriteVisibilityData(RWTexture2D<PackedType> OutTexture, uint2 Coords, PackedType Data)
+{
+#if PERMUTATION_RASTER_ATOMIC == RASTER_NVIDIA
+	PackedType PrevData = NvInterlockedMaxUint64(OutTexture, Coords, Data);
+	return PrevData;
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_AMD_DX11
+	PackedType PrevData = AmdDxExtShaderIntrinsics_AtomicMaxU64(OutTexture, Coords, Data);
+	return PrevData;
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_AMD_DX12
+	PackedType PrevData = AmdExtD3DShaderIntrinsics_AtomicMaxU64(OutTexture, Coords, Data);
+	return PrevData;
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_PLATFORM && COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS && COMPILER_SUPPORTS_ULONG_TYPES
+	ImageInterlockedMaxUInt64(OutTexture, Coords, Data);
+	// Need to expose the returned value version of ImageInterlockedMaxUInt64
+	return Data;
+#else
+	return (PackedType)0;
+#endif
+}
+
+///////////////////////////////////////////////////////////////////////////
+uint			DispatchCountX;
+uint			ResolutionMultiplier;
+int2			OutputResolution;
+uint			HairMaterialId;
+
+
+Texture2D<float> SceneDepthTexture;
+
+RWTexture2D<uint>  OutHairCountTexture;
+
+RWTexture2D<PackedType> OutVisibilityTexture0;
+#if PERMUTATION_SPP == 2 || PERMUTATION_SPP == 4
+RWTexture2D<PackedType> OutVisibilityTexture1;
+#endif
+#if PERMUTATION_SPP == 4
+RWTexture2D<PackedType> OutVisibilityTexture2;
+RWTexture2D<PackedType> OutVisibilityTexture3;
+#endif
+
+
+///////////////////////////////////////////////////////////////////////////
+// Helping functions 
+
+float3 NDCToPixelCoord(float4 InDC)
+{
+	const float3 NDC = InDC.xyz / InDC.w;
+	float2 UV = NDC.xy * ResolvedView.ScreenPositionScaleBias.xy + ResolvedView.ScreenPositionScaleBias.wz;
+	return float3(UV * OutputResolution, NDC.z);
+}
+
+float ToCoverage(FTressFXControlPoint CP, float4 NDC, float RadiusAtDepth1Primary)
+{
+	const float SceneDepth = NDC.w;
+	const float PixelRadius = SceneDepth * RadiusAtDepth1Primary;
+	return CP.WorldRadius / max(CP.WorldRadius, PixelRadius);
+}
+
+void Swap(inout float V0, inout float V1)
+{
+	float T = V0;
+	V0 = V1;
+	V1 = T;
+}
+
+void Swap(inout float3 V0, inout float3 V1)
+{
+	float3 T = V0;
+	V0 = V1;
+	V1 = T;
+}
+
+bool IsVisible(float3 SP)
+{
+	const float DeviceZ = SP.z;
+	const uint2 SceneCoord = SP.xy / ResolutionMultiplier;
+	return DeviceZ > SceneDepthTexture.Load(uint3(SceneCoord, 0)); // InverseZ
+}
+
+bool IsVisible(int2 PixelCoords, float HairDeviceZ)
+{
+	const float DeviceZ = SceneDepthTexture.Load(uint3(PixelCoords, 0)); // InverseZ
+	return HairDeviceZ >= DeviceZ;
+}
+
+bool IsInScreen(int2 C)
+{
+	return C.x >= 0 && C.x < OutputResolution.x && C.y >= 0 && C.y < OutputResolution.y;
+}
+
+void Rasterize(int2 Coords, float Ratio, float Depth, uint PrimitiveId, float Coverage)
+{
+	if (IsInScreen(Coords))
+	{
+		// Fine culling per pixel
+		// Fine grain culling is disabled, as it creates some flickering (on Nvidia cards). It is unclear if this is driver bug or another issue.
+		#if 1
+		const bool bIsVisible = IsVisible(Coords, Depth);
+		if (!bIsVisible)
+			return;
+		#endif
+		const uint PackedCoverage = PackCoverageAndTressFXHairCount(Ratio * Coverage);
+		InterlockedAdd(OutHairCountTexture[uint2(Coords)], PackedCoverage);
+
+		uint2 PackedVisibility;
+		PackedVisibility.x = PackTressFXVisSample(PrimitiveId, HairMaterialId);
+		PackedVisibility.y = PackTressFXVisSampleDepth(Depth, Coverage);
+
+		PackedType In = ToPackedType(PackedVisibility);
+		PackedType Out = 0;
+
+	#if PERMUTATION_SPP == 1
+		WriteVisibilityData(OutVisibilityTexture0, Coords, In);
+	#endif
+
+	#if PERMUTATION_SPP == 2
+		Out = WriteVisibilityData(OutVisibilityTexture0, Coords, In);
+		In  = NextValue(In, Out);
+			
+		WriteVisibilityData(OutVisibilityTexture1, Coords, In);
+	#endif
+
+	#if PERMUTATION_SPP == 4
+		Out = WriteVisibilityData(OutVisibilityTexture0, Coords, In);
+		In  = NextValue(In, Out);
+			
+		Out = WriteVisibilityData(OutVisibilityTexture1, Coords, In);
+		In  = NextValue(In, Out);
+			
+		Out = WriteVisibilityData(OutVisibilityTexture2, Coords, In);
+		In  = NextValue(In, Out);
+			
+		WriteVisibilityData(OutVisibilityTexture3, Coords, In);
+	#endif
+	}
+}
+
+
+#define GROUP_SIZE 32
+#define GROUP_COUNT_X 16
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+#if PERMUTATION_CULLING == 1
+	uint VertexIndex0 = DispatchThreadID.x + DispatchThreadID.y * GROUP_SIZE * GROUP_COUNT_X;
+#else
+	uint VertexIndex0 = DispatchThreadID.x + DispatchThreadID.y * GROUP_SIZE * DispatchCountX;
+#endif
+
+
+
+}

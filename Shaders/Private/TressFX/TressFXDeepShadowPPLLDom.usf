@@ -1,0 +1,100 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+#include "TressFXDeepShadowCommonStruct.ush"
+
+
+#include "../Common.ush"
+
+
+#include "TressFXDeepShadowCommon.ush"
+
+static const float FixPointMaxValue = 1000;	// 100m @hair_todo: make this camera relative, and expose a CVAR fix changing this value
+static const float FixPointScale	= 100;	// 0.1mm precision
+static const float FixPointRange	= 2 * FixPointMaxValue * FixPointScale;    
+
+#define SUPPORT_OPACITY_MASK 0
+
+#define THREAD_GROUP_SIZE 64
+
+
+float4 LayerDepths;
+uint2 ViewportResolution;
+StructuredBuffer<uint> DeepShadowStartOffsetBufferR;
+StructuredBuffer<FDeepShadowDepthCoverage> DeepShadowDepthCoverageBufferR;
+RWTexture2D<float> FrontDepthAtlasTextureRW;
+RWTexture2D<float4> DeepShadowLayersAtlasTextureRW;
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void DeepShadowPPLLDomCS(uint GIndex : SV_GroupIndex,
+                    uint3 GId : SV_GroupID,
+                    uint3 DTid : SV_DispatchThreadID)
+{
+    int GlobalIndex = GId.x * THREAD_GROUP_SIZE + GIndex;
+		
+	uint Offset = DeepShadowStartOffsetBufferR[GlobalIndex];
+	if(0xFFFFFFFF == Offset)
+		return ;
+
+
+	uint2 PixelCoord = uint2(GlobalIndex%ViewportResolution.x,GlobalIndex/ViewportResolution.x);
+
+	float FrontDepth = 0;
+
+	float2 ElemArr[20];
+	int NumLayers = 0;
+#if HAS_INVERTED_Z_BUFFER
+	FrontDepth = 0;
+	while(Offset != 0xFFFFFFFF)
+	{
+		FDeepShadowDepthCoverage Elem = DeepShadowDepthCoverageBufferR[Offset];
+		Offset = Elem.Next;
+		FrontDepth = max(FrontDepth,Elem.Depth);
+		if(NumLayers < 20)
+			ElemArr[NumLayers++] = float2(Elem.Depth,Elem.Coverage);
+	}
+#else
+	FrontDepth = 1;
+	while(Offset != 0xFFFFFFFF)
+	{
+		FDeepShadowDepthCoverage Elem = DeepShadowDepthCoverageBufferR[Offset];
+		Offset = Elem.Next;
+		FrontDepth = min(FrontDepth,Elem.Depth);
+		if(NumLayers < 20)
+			ElemArr[NumLayers++] = float2(Elem.Depth,Elem.Coverage);
+	}
+
+#endif
+
+	float4 Color = 0;
+	for(int i=0;i<NumLayers;++i)
+	{
+		const float DistanceToFrontDepth = GetDomDistanceToFrontDepthTFX(FrontDepth, ElemArr[i].x);
+		Color += ComputeDOMWeightsTFX(DistanceToFrontDepth, LayerDepths) * ElemArr[i].y;
+	}
+
+	FrontDepthAtlasTextureRW[PixelCoord] = FrontDepth;
+	DeepShadowLayersAtlasTextureRW[PixelCoord] = Color;
+
+}
+
+

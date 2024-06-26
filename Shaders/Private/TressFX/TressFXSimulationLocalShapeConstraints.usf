@@ -1,0 +1,100 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "../Common.ush"
+#include "TressFXSimulationCommon.ush"
+
+
+float Stiffness[32];
+
+
+float3 GuidesRestPositionOffset;
+
+Buffer<uint4>  GuidesRestPositionBuffer;
+
+RWBuffer<float4> GuidesDeformedPositionBuffer; 
+
+StructuredBuffer<FStrandLevelData> GuidesDeformedStrandLevelDataBuffer;
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void LocalShapeConstraints(uint GIndex : SV_GroupIndex,
+	                          uint3 GId : SV_GroupID,
+	                          uint3 DTid : SV_DispatchThreadID)
+{
+	uint GlobalStrandIndex, NumVerticesInTheStrand, GlobalRootVertexIndex, StrandType;
+	CalcIndicesInStrandLevelMaster(GIndex, GId.x, GlobalStrandIndex, NumVerticesInTheStrand, GlobalRootVertexIndex, StrandType);
+
+	//--------------------------------------------
+    // Local shape constraint for bending/twisting
+    //--------------------------------------------
+    {
+        float4 boneQuat = GuidesDeformedStrandLevelDataBuffer[GlobalStrandIndex].SkinningQuat;
+
+		float StiffnessForLocalShapeMatching = 0;
+
+		// vertex 1 through n-1
+		for ( uint LocalVertexIndex = 1; LocalVertexIndex < NumVerticesInTheStrand-1; LocalVertexIndex++ )
+        {
+            uint GlobalVertexIndex = GlobalRootVertexIndex + LocalVertexIndex;
+
+			StiffnessForLocalShapeMatching = Stiffness[LocalVertexIndex];
+
+			float4 pos = GuidesDeformedPositionBuffer[GlobalVertexIndex];
+			float4 pos_plus_one = GuidesDeformedPositionBuffer[GlobalVertexIndex + 1];
+			float4 pos_minus_one = GuidesDeformedPositionBuffer[GlobalVertexIndex - 1];
+			
+			uint4 PackedRestPosition = GuidesRestPositionBuffer[GlobalVertexIndex];
+			float3 RestPos0 = f16tof32(PackedRestPosition.xyz) + GuidesRestPositionOffset;
+			PackedRestPosition = GuidesRestPositionBuffer[GlobalVertexIndex+1];
+			float3 RestPos1 = f16tof32(PackedRestPosition.xyz) + GuidesRestPositionOffset;
+			PackedRestPosition = GuidesRestPositionBuffer[GlobalVertexIndex-1];
+			float3 RestPos2 = f16tof32(PackedRestPosition.xyz) + GuidesRestPositionOffset;
+
+			float3 bindPos = MultQuaternionAndVector(boneQuat, RestPos0);
+			float3 bindPos_plus_one = MultQuaternionAndVector(boneQuat, RestPos1);
+			float3 bindPos_minus_one = MultQuaternionAndVector(boneQuat, RestPos2);
+
+			float3 lastVec = pos.xyz - pos_minus_one.xyz;
+
+			float4 invBone = InverseQuaternion(boneQuat);
+			float3 vecBindPose = bindPos_plus_one - bindPos;
+            float3 lastVecBindPose = bindPos - bindPos_minus_one;
+			float4 rotGlobal = QuatFromTwoUnitVectors(normalize(lastVecBindPose), normalize(lastVec));
+
+            float3 orgPos_i_plus_1_InGlobalFrame =  MultQuaternionAndVector(rotGlobal, vecBindPose) + pos.xyz;
+            float3 del = StiffnessForLocalShapeMatching * (orgPos_i_plus_1_InGlobalFrame - pos_plus_one.xyz);
+
+            if ( IsMovable(asuint(pos.w)) )
+                pos.xyz -= del.xyz;
+
+            if ( IsMovable(asuint(pos_plus_one.w)) )
+                pos_plus_one.xyz += del.xyz;
+
+				
+            GuidesDeformedPositionBuffer[GlobalVertexIndex] = pos;
+            GuidesDeformedPositionBuffer[GlobalVertexIndex+1] = pos_plus_one;
+        }
+    }
+}
+

@@ -1,0 +1,293 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "../Common.ush"
+#include "TressFXSimulationSDFCommon.ush"
+
+
+struct FCollisionMeshBox
+{
+	float4 Min;
+	float4 Max;
+	float4 CellSize;
+};
+StructuredBuffer<FCollisionMeshBox> CMBoxR;
+
+int NumGridOffset;
+//#define NumGridOffset 2
+
+RWStructuredBuffer<uint> SDFBufferRW;
+
+struct FTressFXMeshVertexData
+{
+	float4 Position;
+	float4 Normal;
+};
+StructuredBuffer<FTressFXMeshVertexData> MeshDeformedVertexBuffer;
+
+StructuredBuffer<uint> MeshRestIndicesBuffer;
+
+int3 GetSdfCoordinates(float3 PositionInWorld)
+{
+    float3 SdfPosition = (PositionInWorld - CMBoxR[0].Min.xyz) / CMBoxR[0].CellSize.xyz;
+    
+    int3 Result;
+    Result.x = (int)SdfPosition.x;
+    Result.y = (int)SdfPosition.y;
+    Result.z = (int)SdfPosition.z;
+    
+    return Result;
+}
+
+int GetSdfCellIndex(int3 GridPosition)
+{
+    int CellsPerLine = NumSDFCells.x;
+    int CellsPerPlane = NumSDFCells.x * NumSDFCells.y;
+
+    return CellsPerPlane * GridPosition.z + CellsPerLine * GridPosition.y + GridPosition.x;
+}
+
+float3 GetSdfCellPosition(int3 GridPosition)
+{
+    float3 CellCenter = float3(GridPosition.x, GridPosition.y, GridPosition.z) * CMBoxR[0].CellSize.xyz + 0.5*CMBoxR[0].CellSize.xyz;
+    CellCenter += CMBoxR[0].Min.xyz;
+    
+    return CellCenter;
+}
+
+float DistancePointToEdge(float3 p, float3 x0, float3 x1, out float3 n)
+{
+	float3 x10 = x1 - x0;
+
+	float t = dot(x1 - p, x10) / dot(x10, x10);
+	t = max(0.0f, min(t, 1.0f));
+
+	float3 a = p - (t*x0 + (1.0f - t)*x1);
+	float d = length(a);
+	n = a / (d + 1e-30f);
+
+	return d;
+}
+
+// Check if p is in the positive or negative side of triangle (x0, x1, x2)
+// Positive side is where the normal vector of triangle ( (x1-x0) x (x2-x0) ) is pointing to.
+float SignedDistancePointToTriangle(float3 p, float3 x0, float3 x1, float3 x2,out float3 Dir)
+{
+	float d = 0;
+	float3 x02 = x0 - x2;
+	float l0 = length(x02) + 1e-30f;
+	x02 = x02 / l0;
+	float3 x12 = x1 - x2;
+	float l1 = dot(x12, x02);
+	x12 = x12 - l1*x02;
+	float l2 = length(x12) + 1e-30f;
+	x12 = x12 / l2;
+	float3 px2 = p - x2;
+
+	float b = dot(x12, px2) / l2;
+	float a = (dot(x02, px2) - l1*b) / l0;
+	float c = 1 - a - b;
+
+	// normal vector of triangle. Don't need to normalize this yet.
+	float3 nTri = cross((x1 - x0), (x2 - x0));
+	float3 n;
+
+	float tol = 1e-8f;
+
+	if (a >= -tol && b >= -tol && c >= -tol)
+	{
+		n = p - (a*x0 + b*x1 + c*x2);
+		d = length(n);
+
+		float3 n1 = n / d;
+		float3 n2 = nTri / (length(nTri) + 1e-30f);		// if d == 0
+
+		n = (d > 0) ? n1 : n2;
+	}
+	else
+	{
+		float3 n_12;
+		float3 n_02;
+		d = DistancePointToEdge(p, x0, x1, n);
+
+		float d12 = DistancePointToEdge(p, x1, x2, n_12);
+		float d02 = DistancePointToEdge(p, x0, x2, n_02);
+
+		d = min(d, d12);
+		d = min(d, d02);
+
+		n = (d == d12) ? n_12 : n;
+		n = (d == d02) ? n_02 : n;
+	}
+
+	Dir = n;
+	d = (dot(p - x0, nTri) < 0.f) ? -d : d;
+
+	return d;
+}
+
+#if defined(PERMUTATION_SDF_VISUALIZATION) && PERMUTATION_SDF_VISUALIZATION == 1
+
+RWStructuredBuffer<uint> SDFDirectionCounterRW;
+RWStructuredBuffer<uint> SDFDirectionStartOffsetBufferRW;
+
+struct FDirectionAndCellIndex
+{
+	float3 Direction;
+	float Distance;
+	uint CellIndex;
+	uint Next;
+};
+RWStructuredBuffer<FDirectionAndCellIndex> SDFDirectionBufferRW;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SDFGenConstruct(uint GIndex : SV_GroupIndex,
+                    uint3 GId : SV_GroupID,
+                    uint3 DTid : SV_DispatchThreadID)
+{
+	int TriangleIndex = GId.x * THREAD_GROUP_SIZE + GIndex;
+
+	uint NumTriangleIndices, Stride;
+	MeshRestIndicesBuffer.GetDimensions(NumTriangleIndices, Stride);
+	uint NumTriangles = NumTriangleIndices / 3;
+		
+	if (TriangleIndex >= (int)NumTriangles) 
+		return;
+
+	uint Index0 = MeshRestIndicesBuffer[TriangleIndex * 3 + 0];
+	uint Index1 = MeshRestIndicesBuffer[TriangleIndex * 3 + 2];
+	uint Index2 = MeshRestIndicesBuffer[TriangleIndex * 3 + 1];
+
+	float3 Tri0 = MeshDeformedVertexBuffer[Index0].Position.xyz;
+	float3 Tri1 = MeshDeformedVertexBuffer[Index1].Position.xyz;
+	float3 Tri2 = MeshDeformedVertexBuffer[Index2].Position.xyz;
+		
+	float3 AabbMin = min(Tri0, min(Tri1, Tri2));// - CMBoxR[0].CellSize.xyz;
+	float3 AabbMax = max(Tri0, max(Tri1, Tri2));// + CMBoxR[0].CellSize.xyz;
+	
+	int3 GridMin = GetSdfCoordinates(AabbMin) - int3(1,1,1)*NumGridOffset;
+	int3 GridMax = GetSdfCoordinates(AabbMax) + int3(1,1,1)*NumGridOffset;
+
+	GridMin.x = max(0, min(GridMin.x, NumSDFCells.x - 1));
+	GridMin.y = max(0, min(GridMin.y, NumSDFCells.y - 1));
+	GridMin.z = max(0, min(GridMin.z, NumSDFCells.z - 1));
+
+	GridMax.x = max(0, min(GridMax.x, NumSDFCells.x - 1));
+	GridMax.y = max(0, min(GridMax.y, NumSDFCells.y - 1));
+	GridMax.z = max(0, min(GridMax.z, NumSDFCells.z - 1));
+
+	float3 Dir=float3(1,0,0);
+	for (int z = GridMin.z; z <= GridMax.z; ++z)
+		for (int y = GridMin.y; y <= GridMax.y; ++y)
+			for (int x = GridMin.x; x <= GridMax.x; ++x)
+			{
+				int3 GridCellCoordinate = int3(x, y, z);
+				int GridCellIndex = GetSdfCellIndex(GridCellCoordinate);
+				float3 CellPosition = GetSdfCellPosition(GridCellCoordinate);
+
+				float Distance = SignedDistancePointToTriangle(CellPosition, Tri0, Tri1, Tri2, Dir);
+				
+				uint DistanceAsUint = FloatFlip3(Distance);
+				InterlockedMin(SDFBufferRW[GridCellIndex], DistanceAsUint);
+
+//------------------------SDF Visualization------------------------------
+	// in a way <Per Voxel Linked List>
+				uint DirBufferCount=0;
+				InterlockedAdd(SDFDirectionCounterRW[0],1,DirBufferCount);
+				
+				uint OldStartOffset;
+				InterlockedExchange(SDFDirectionStartOffsetBufferRW[GridCellIndex],DirBufferCount,OldStartOffset);
+				
+				FDirectionAndCellIndex Elem;
+				Elem.Direction = Dir;
+				Elem.Distance = Distance;
+				Elem.CellIndex = GridCellIndex;
+				Elem.Next = OldStartOffset;
+				SDFDirectionBufferRW[DirBufferCount] = Elem;
+
+//------------------------SDF Visualization------------------------------
+
+			}
+}
+
+#endif
+
+
+
+#if defined(PERMUTATION_SDF_VISUALIZATION) && PERMUTATION_SDF_VISUALIZATION == 0
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SDFGenConstruct(uint GIndex : SV_GroupIndex,
+                    uint3 GId : SV_GroupID,
+                    uint3 DTid : SV_DispatchThreadID)
+{
+	int TriangleIndex = GId.x * THREAD_GROUP_SIZE + GIndex;
+
+	uint NumTriangleIndices, Stride;
+	MeshRestIndicesBuffer.GetDimensions(NumTriangleIndices, Stride);
+	uint NumTriangles = NumTriangleIndices / 3;
+		
+	if (TriangleIndex >= (int)NumTriangles) 
+		return;
+
+	uint Index0 = MeshRestIndicesBuffer[TriangleIndex * 3 + 0];
+	uint Index1 = MeshRestIndicesBuffer[TriangleIndex * 3 + 2];
+	uint Index2 = MeshRestIndicesBuffer[TriangleIndex * 3 + 1];
+
+	float3 Tri0 = MeshDeformedVertexBuffer[Index0].Position.xyz;
+	float3 Tri1 = MeshDeformedVertexBuffer[Index1].Position.xyz;
+	float3 Tri2 = MeshDeformedVertexBuffer[Index2].Position.xyz;
+		
+	float3 AabbMin = min(Tri0, min(Tri1, Tri2));// - CMBoxR[0].CellSize.xyz;
+	float3 AabbMax = max(Tri0, max(Tri1, Tri2));// + CMBoxR[0].CellSize.xyz;
+	
+	int3 GridMin = GetSdfCoordinates(AabbMin) - int3(1,1,1)*NumGridOffset;
+	int3 GridMax = GetSdfCoordinates(AabbMax) + int3(1,1,1)*NumGridOffset;
+
+	GridMin.x = max(0, min(GridMin.x, NumSDFCells.x - 1));
+	GridMin.y = max(0, min(GridMin.y, NumSDFCells.y - 1));
+	GridMin.z = max(0, min(GridMin.z, NumSDFCells.z - 1));
+
+	GridMax.x = max(0, min(GridMax.x, NumSDFCells.x - 1));
+	GridMax.y = max(0, min(GridMax.y, NumSDFCells.y - 1));
+	GridMax.z = max(0, min(GridMax.z, NumSDFCells.z - 1));
+
+	float3 Dir=float3(1,0,0);
+	for (int z = GridMin.z; z <= GridMax.z; ++z)
+		for (int y = GridMin.y; y <= GridMax.y; ++y)
+			for (int x = GridMin.x; x <= GridMax.x; ++x)
+			{
+				int3 GridCellCoordinate = int3(x, y, z);
+				int GridCellIndex = GetSdfCellIndex(GridCellCoordinate);
+				float3 CellPosition = GetSdfCellPosition(GridCellCoordinate);
+
+				float Distance = SignedDistancePointToTriangle(CellPosition, Tri0, Tri1, Tri2, Dir);
+				
+				uint DistanceAsUint = FloatFlip3(Distance);
+				InterlockedMin(SDFBufferRW[GridCellIndex], DistanceAsUint);
+
+			}
+
+}
+
+#endif

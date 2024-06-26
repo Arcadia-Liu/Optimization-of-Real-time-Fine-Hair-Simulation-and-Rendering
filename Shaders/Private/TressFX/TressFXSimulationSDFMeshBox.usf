@@ -1,0 +1,140 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+#include "../Common.ush"
+#include "TressFXSimulationSDFCommon.ush"
+
+
+struct FIntermediateCollisionMeshBox
+{
+	int4 Max;
+	int4 Min;
+};
+
+RWStructuredBuffer<FIntermediateCollisionMeshBox> ICMBoxRW;
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void SDFMeshBoxInit(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	if(0 == GIndex)
+	{
+		ICMBoxRW[0].Min = int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+		ICMBoxRW[0].Max = -int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+	}
+
+}
+
+
+StructuredBuffer<FIntermediateCollisionMeshBox> ICMBoxR;
+
+struct FCollisionMeshBox
+{
+	float4 Min;
+	float4 Max;
+	float4 CellSize;
+};
+RWStructuredBuffer<FCollisionMeshBox> CMBoxRW;
+
+float CollisionMeshBoxMargin;
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void SDFMeshBoxConstruct(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	if(0 == GIndex)
+	{
+		CMBoxRW[0].Max.xyz = ICMBoxR[0].Max.xyz;
+		CMBoxRW[0].Min.xyz = ICMBoxR[0].Min.xyz;
+
+		CMBoxRW[0].Min.xyz -= float3(CollisionMeshBoxMargin,CollisionMeshBoxMargin,CollisionMeshBoxMargin);
+		CMBoxRW[0].Max.xyz += float3(CollisionMeshBoxMargin,CollisionMeshBoxMargin,CollisionMeshBoxMargin);
+
+		CMBoxRW[0].CellSize.x = (CMBoxRW[0].Max.x - CMBoxRW[0].Min.x)/NumSDFCells.x;
+		CMBoxRW[0].CellSize.y = (CMBoxRW[0].Max.y - CMBoxRW[0].Min.y)/NumSDFCells.y;
+		CMBoxRW[0].CellSize.z = (CMBoxRW[0].Max.z - CMBoxRW[0].Min.z)/NumSDFCells.z;
+
+		CMBoxRW[0].CellSize.w = max(CMBoxRW[0].CellSize.x,max(CMBoxRW[0].CellSize.y,CMBoxRW[0].CellSize.z));
+	}
+}
+
+/*
+//Compute float AABB
+
+
+struct FIntermediateCollisionMeshBox
+{
+	uint4 PositiveMin;
+	uint4 NegativeMin;
+	uint4 PositiveMax;
+	uint4 NegativeMax;
+};
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void SDFMeshBoxInit(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	if(0 == GIndex)
+	{
+		ICMBoxRW[0].PositiveMin = uint4(0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0);
+		ICMBoxRW[0].NegativeMin = uint4(0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0);
+		ICMBoxRW[0].PositiveMax = uint4(0,0,0,0);
+		ICMBoxRW[0].NegativeMax = uint4(0,0,0,0);
+	}
+
+}
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void SDFMeshBoxConstruct(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	if(0 == GIndex)
+	{
+		CMBoxRW[0].Min.x = asfloat(ICMBoxR[0].NegativeMax.x) < 0 ? asfloat(ICMBoxR[0].NegativeMax.x) : asfloat(ICMBoxR[0].PositiveMin.x);
+		CMBoxRW[0].Min.y = asfloat(ICMBoxR[0].NegativeMax.y) < 0 ? asfloat(ICMBoxR[0].NegativeMax.y) : asfloat(ICMBoxR[0].PositiveMin.y);
+		CMBoxRW[0].Min.z = asfloat(ICMBoxR[0].NegativeMax.z) < 0 ? asfloat(ICMBoxR[0].NegativeMax.z) : asfloat(ICMBoxR[0].PositiveMin.z);
+		CMBoxRW[0].Max.x = asfloat(ICMBoxR[0].PositiveMax.x) > 0 ? asfloat(ICMBoxR[0].PositiveMax.x) : asfloat(ICMBoxR[0].NegativeMin.x);
+		CMBoxRW[0].Max.y = asfloat(ICMBoxR[0].PositiveMax.y) > 0 ? asfloat(ICMBoxR[0].PositiveMax.y) : asfloat(ICMBoxR[0].NegativeMin.y);
+		CMBoxRW[0].Max.z = asfloat(ICMBoxR[0].PositiveMax.z) > 0 ? asfloat(ICMBoxR[0].PositiveMax.z) : asfloat(ICMBoxR[0].NegativeMin.z);
+
+		CMBoxRW[0].Min.xyz -= float3(CollisionMeshBoxMargin,CollisionMeshBoxMargin,CollisionMeshBoxMargin);
+		CMBoxRW[0].Max.xyz += float3(CollisionMeshBoxMargin,CollisionMeshBoxMargin,CollisionMeshBoxMargin);
+
+		CMBoxRW[0].CellSize.x = (CMBoxRW[0].Max.x - CMBoxRW[0].Min.x)/NumSDFCells.x;
+		CMBoxRW[0].CellSize.y = (CMBoxRW[0].Max.y - CMBoxRW[0].Min.y)/NumSDFCells.y;
+		CMBoxRW[0].CellSize.z = (CMBoxRW[0].Max.z - CMBoxRW[0].Min.z)/NumSDFCells.z;
+
+		CMBoxRW[0].CellSize.w = max(CMBoxRW[0].CellSize.x,max(CMBoxRW[0].CellSize.y,CMBoxRW[0].CellSize.z));
+	}
+}
+
+
+*/

@@ -1,0 +1,219 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+#include "../Common.ush"
+
+#include "TressFXAABBCommon.ush"
+#include "TressFXVertexFactoryCommon.ush"
+#include "TressFXSimulationCommon.ush"
+
+
+uint VertexCount;
+uint NumFollowStrands;
+float TipSeparationFactor;
+float LODScale;
+
+StructuredBuffer<float4> FollowRootOffsetBuffer;
+
+Buffer<float4>  GuidesDeformedPositionBuffer;
+
+RWBuffer<float4> StrandsDeformedPositionBuffer; 
+
+groupshared float4 SharedPos[THREAD_GROUP_SIZE];
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MainCS(uint GIndex : SV_GroupIndex,
+                  uint3 GId : SV_GroupID,
+                  uint3 DTid : SV_DispatchThreadID)
+{
+	uint GlobalStrandIndex, LocalStrandIndex, GlobalVertexIndex, LocalVertexIndex, NumVerticesInTheStrand, IndexForSharedMem, StrandType;
+    CalcIndicesInVertexLevelMaster(GIndex, GId.x, GlobalStrandIndex, LocalStrandIndex, GlobalVertexIndex, LocalVertexIndex, NumVerticesInTheStrand, IndexForSharedMem, StrandType);
+
+	if(GlobalVertexIndex >= VertexCount)
+		return ;
+
+	uint LODGlobalStrandIndex = GlobalStrandIndex*LODScale;
+	
+	uint LODGlobalVertexIndex = LODGlobalStrandIndex * NumVerticesInTheStrand + LocalVertexIndex;
+
+    SharedPos[IndexForSharedMem] = GuidesDeformedPositionBuffer[LODGlobalVertexIndex];
+//    GroupMemoryBarrierWithGroupSync();
+
+	uint GlobalFollowVertexBaseIndex = LocalVertexIndex 
+						+ GlobalStrandIndex*(NumFollowStrands+1)*NumVerticesInTheStrand;
+	
+	StrandsDeformedPositionBuffer[GlobalFollowVertexBaseIndex] = SharedPos[IndexForSharedMem];
+
+	uint FollowOffsetBaseIndex = LODGlobalStrandIndex*NumFollowStrands;
+	for(uint i=0;i<NumFollowStrands;++i)
+	{
+		float Factor = TipSeparationFactor;// * LocalVertexIndex / NumVerticesInTheStrand;
+		float4 Offset = FollowRootOffsetBuffer[FollowOffsetBaseIndex+i];
+		StrandsDeformedPositionBuffer[GlobalFollowVertexBaseIndex+(1+i)*NumVerticesInTheStrand] = float4(SharedPos[IndexForSharedMem].xyz+Factor*Offset.xyz,SharedPos[IndexForSharedMem].w);
+	}
+
+}
+
+uint NumStrandsToRender;
+RWStructuredBuffer<uint>		StrandsIDBuffer;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MainStrandsIDCS(uint GIndex : SV_GroupIndex,
+                  uint3 GId : SV_GroupID,
+                  uint3 DTid : SV_DispatchThreadID)
+{
+	uint StrandIndex = GId.x*THREAD_GROUP_SIZE + GIndex;
+	
+	if(StrandIndex >= NumStrandsToRender)
+		return ;
+
+	uint GlobalStrandIndex = StrandIndex*LODScale;
+
+	uint StrandID = GlobalStrandIndex / (1+NumFollowStrands);
+
+	StrandsIDBuffer[StrandIndex] = StrandID;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MainTempCS(uint GIndex : SV_GroupIndex,
+                  uint3 GId : SV_GroupID,
+                  uint3 DTid : SV_DispatchThreadID)
+{
+	
+    uint GlobalVertexIndex = GId.x*THREAD_GROUP_SIZE+GIndex;
+
+	if(GlobalVertexIndex >= VertexCount)
+		return ;
+
+    float4 Position = GuidesDeformedPositionBuffer[GlobalVertexIndex];
+	
+	StrandsDeformedPositionBuffer[GlobalVertexIndex] = Position;
+
+}
+		
+	//const bool bIsValid = true;//ScaleAndClip(VertexIndex, PackedRestPosition.w);
+	//WorldVertexPosition = bIsValid ? ControlPoint + CurrOffset : float3(POSITIVE_INFINITY, POSITIVE_INFINITY, POSITIVE_INFINITY);
+
+	//float3x3 LocalToWorld = (float3x3)LocalToWorldMatrix;
+	//WorldVertexPosition = mul(WorldVertexPosition,LocalToWorld);
+	
+	//float3 ControlPoint = f16tof32(PackedRestPosition.xyz) + InGuidesRestPositionOffset;
+	//OutPosition = uint4(f32tof16(WorldVertexPosition), PackedRestPosition.w);
+
+
+#if SHADER_GROUPAABB
+
+
+uint DispatchCountX;
+uint ClusterCount;
+uint NumGuidesVertices;
+
+Buffer<uint> ClusterVertexIdBuffer;
+Buffer<uint> ClusterIdBuffer;
+Buffer<uint> ClusterIndexOffsetBuffer;
+Buffer<uint> ClusterIndexCountBuffer;
+
+Buffer<uint> TressFXVF_CullingIndirectBuffer;
+
+RWBuffer<int> OutGroupAABBBuffer; 		// Group data packed as {uint3 AABBMin, uint3 AABBMax}
+
+
+
+struct FIntermediateClusterBox
+{
+	int4 Max;
+	int4 Min;
+};
+
+
+[numthreads(THREAD_GROUP_SIZE,1,1)]
+void GroupAABBInitCS(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	if(0 == GIndex)
+	{
+		OutGroupAABBBuffer[0] = 0x7FFFFFFF;
+		OutGroupAABBBuffer[1] = 0x7FFFFFFF;
+		OutGroupAABBBuffer[2] = 0x7FFFFFFF;
+		OutGroupAABBBuffer[3] = -0x7FFFFFFF;
+		OutGroupAABBBuffer[4] = -0x7FFFFFFF;
+		OutGroupAABBBuffer[5] = -0x7FFFFFFF;
+	}
+}
+
+groupshared FIntermediateClusterBox LDS_ICBox;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void GroupAABBEvaluationCS(
+	uint GIndex : SV_GroupIndex, 
+	uint3 GId : SV_GroupID, 
+	uint3 DTid : SV_DispatchThreadID)
+{
+	uint LocalId = GIndex;
+	uint GroupId = GId.x;
+	uint GlobalId = LocalId + GroupId * THREAD_GROUP_SIZE;
+
+	//GlobalId = GlobalId >= NumGuidesVertices ? NumGuidesVertices : GlobalId;
+
+	float3 Pos = GuidesDeformedPositionBuffer[GlobalId].xyz;
+		
+	if(0 == GIndex)
+	{
+		LDS_ICBox.Min = int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+		LDS_ICBox.Max = -int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	int3 IntPos = Pos;
+	int3 IntPosMin = IntPos - 1;
+	int3 IntPosMax = IntPos + 1;
+	
+	if(IntPos.x == 0 && IntPos.y == 0 && IntPos.z == 0)
+	{
+		IntPosMin = int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+		IntPosMax = -int4(0x7FFFFFFF,0x7FFFFFFF,0x7FFFFFFF,0);
+	}
+
+	InterlockedMax(LDS_ICBox.Max.x,IntPosMax.x);
+	InterlockedMin(LDS_ICBox.Min.x,IntPosMin.x);
+	InterlockedMax(LDS_ICBox.Max.y,IntPosMax.y);
+	InterlockedMin(LDS_ICBox.Min.y,IntPosMin.y);
+	InterlockedMax(LDS_ICBox.Max.z,IntPosMax.z);
+	InterlockedMin(LDS_ICBox.Min.z,IntPosMin.z);
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if(0 == GIndex)
+	{
+		InterlockedMin(OutGroupAABBBuffer[0],LDS_ICBox.Min.x);
+		InterlockedMin(OutGroupAABBBuffer[1],LDS_ICBox.Min.y);
+		InterlockedMin(OutGroupAABBBuffer[2],LDS_ICBox.Min.z);
+		InterlockedMax(OutGroupAABBBuffer[3],LDS_ICBox.Max.x);
+		InterlockedMax(OutGroupAABBBuffer[4],LDS_ICBox.Max.y);
+		InterlockedMax(OutGroupAABBBuffer[5],LDS_ICBox.Max.z);
+	}
+}
+
+#endif // SHADER_CLUSTERAABB

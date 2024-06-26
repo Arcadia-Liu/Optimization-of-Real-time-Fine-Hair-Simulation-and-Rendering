@@ -1,0 +1,286 @@
+//
+// Copyright (c) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+
+
+#include "../Common.ush"
+#include "TressFXCommon.ush"
+#include "../DeferredShadingCommon.ush"  
+#include "../BRDF.ush"
+#include "../ReflectionEnvironmentShared.ush"
+#include "../SkyLightingShared.ush"
+#include "../DistanceFieldAOShared.ush"
+#include "../ShadingModels.ush"
+#include "../LightGridCommon.ush"
+#include "../SceneTextureParameters.ush"
+
+
+// Disable static lighting, as hair don't have any diffused lighting baked, 
+// and rely solely on specular information (i.e. reflection capture)
+#undef ALLOW_STATIC_LIGHTING
+#define ALLOW_STATIC_LIGHTING 0
+
+#define ENABLE_SKY_LIGHT 1
+#define REFLECTION_COMPOSITE_USE_BLENDED_REFLECTION_CAPTURES 1
+#define REFLECTION_COMPOSITE_SUPPORT_SKYLIGHT_BLEND 0
+#define REFLECTION_COMPOSITE_HAS_BOX_CAPTURES 1
+#define REFLECTION_COMPOSITE_HAS_SPHERE_CAPTURES 1
+#include "../ReflectionEnvironmentComposite.ush"
+
+#include "../HairBsdf.ush"
+#include "TressFXVisibilityCommon.ush"
+#include "TressFXDeepShadowCommon.ush"
+#include "TressFXDeepTransmittanceCommon.ush"
+#include "TressFXDeepTransmittanceDualScattering.ush"
+
+#include "../ShaderDrawDebug.ush"
+
+#define INTEGRATION_SCENECOLOR 0
+#define INTEGRATION_ADHOC 1
+#define INTEGRATION_UNIFORM 2
+#define INTEGRATION_SH 3
+
+
+float GetPreExposure()
+{
+	#if USE_PREEXPOSURE
+	const float PreExposure = View.PreExposure;
+	#else
+	const float PreExposure = 1.f;
+	#endif
+	return PreExposure;
+}
+
+float3 GatherRadiance(float3 RayDirection, float Roughness, uint2 PixelPosition, float PixelSceneDepth, float3 AbsoluteWorldPosition)
+{
+	const float IndirectIrradiance = 1;
+	const int SingleCaptureIndex = 0;
+
+	const uint EyeIndex = 0;
+	const uint GridIndex = ComputeLightGridCellIndex(PixelPosition, PixelSceneDepth, EyeIndex);
+
+	const uint NumCulledEntryIndex = (ForwardLightData.NumGridCells + GridIndex) * NUM_CULLED_LIGHTS_GRID_STRIDE;
+	const uint NumLocalReflectionCaptures = min(ForwardLightData.NumCulledLightsGrid[NumCulledEntryIndex + 0], ForwardLightData.NumReflectionCaptures);
+	const uint DataStartIndex = ForwardLightData.NumCulledLightsGrid[NumCulledEntryIndex + 1];
+
+	const bool bCompositeSkylight = true;
+	return CompositeReflectionCapturesAndSkylight(
+		1.0f,
+		AbsoluteWorldPosition,
+		RayDirection,
+		Roughness,
+		IndirectIrradiance,
+		1.0f,
+		0.0f,
+		NumLocalReflectionCaptures,
+		DataStartIndex,
+		SingleCaptureIndex,
+		bCompositeSkylight,
+		EyeIndex);
+}
+
+
+StructuredBuffer<FPackedTressFXSample> HairVisibilityNodeData;
+
+Texture3D<float4>			HairScatteringLUTTexture;
+Texture3D<float4>			HairEnergyLUTTexture;
+SamplerState 				HairLUTSampler; 
+
+float4 SkyLight_OcclusionTintAndMinOcclusion;
+float SkyLight_OcclusionExponent;
+uint SkyLight_OcclusionCombineMode;
+
+float HairDistanceThreshold;
+uint bHairUseViewHairCount;
+Texture2D<float> HairCountTexture;
+
+uint  MultipleScatterSampleCount;
+uint  HairComponents;
+float HairDualScatteringRoughnessOverride;
+float TransmissionDensityScaleFactor;
+
+// Spherical based harmonic integration
+
+float3 ReflectionEnvironmentSH(
+	FGBufferData GBuffer,
+	float2 ScreenPosition,
+	float2 SvPosition,
+	uint PrimitiveId,
+	uint MacroGroupId,
+	bool bDebugEnabled)
+{
+	const float PreExposure = GetPreExposure();
+	const float3 WorldPosition = mul(float4(ScreenPosition * GBuffer.Depth, GBuffer.Depth, 1), View.ScreenToWorld).xyz;
+	const float3 CameraToPixel = normalize(WorldPosition - View.WorldCameraOrigin);
+
+	const float3 V = -CameraToPixel;
+	const float3 T = GBuffer.WorldNormal;
+	const float3 N = T;
+	const float3 L = normalize(V - N * dot(V, N));
+
+	FTressFXTransmittanceMask TransmittanceMask;
+	TransmittanceMask.Transmittance = 1;
+	TransmittanceMask.HairCount = 0;
+	TransmittanceMask.Visibility = 1;
+	FHairTransmittanceData TransmittanceData = GetTressFXTransmittance(
+		V,
+		L,
+		GBuffer,
+		TransmittanceMask,
+		HairScatteringLUTTexture,
+		HairLUTSampler,
+		HairComponents);
+
+	bool bEvalMultiScatter = true;
+	float3 f_s = PI * HairShading(GBuffer, L, V, N, 1, TransmittanceData, 1, 0.2, uint2(0, 0));
+
+	// This logic mimic the ReflecitonEnvironemtPixelShader.usf. Ideallyw we should share the same 
+	// code/path, but the various permutation make the code a bit obscure
+	// Need to take into account DFAO?
+	float3 Lighting = 0;
+	{
+	#if 0
+		// Diffuse SH lighting. Require to have GI data laydown during the based pass
+		float AmbientOcclusion = 1;
+		float SkyVisibility = 1;
+		float3 SkyLightingNormal = GBuffer.WorldNormal;
+
+		// Apply DFAO controls
+		SkyVisibility = pow(SkyVisibility, SkyLight_OcclusionExponent);
+		SkyVisibility = lerp(SkyVisibility, 1, SkyLight_OcclusionTintAndMinOcclusion.w);
+
+		// Combine with other AO sources
+		if (SkyLight_OcclusionCombineMode == 0)
+		{
+			// Combine with min which nicely avoids over-occlusion in cases where strong DFAO is present along with strong SSAO (distant trees)
+			SkyVisibility = min(SkyVisibility, min(GBuffer.GBufferAO, AmbientOcclusion));
+		}
+		else
+		{
+			// Combine with mul, which continues to add SSAO depth even indoors.  SSAO will need to be tweaked to be less strong.
+			SkyVisibility = SkyVisibility * min(GBuffer.GBufferAO, AmbientOcclusion);
+		}
+		const float3 DiffuseLighting = PreExposure * GetSkySHDiffuse(L) * View.SkyLightColor.rgb;
+		Lighting = SkyVisibility * DiffuseLighting * f_s + (1 - SkyVisibility) * SkyLight_OcclusionTintAndMinOcclusion.xyz * f_s;
+	#else
+		// Probe lighting
+		const uint2  PixelPosition = SvPosition - ResolvedView.ViewRectMin.xy;
+		const float  PixelSceneDepth = GBuffer.Depth;
+		Lighting = PreExposure * GatherRadiance(L, GBuffer.Roughness, PixelPosition, PixelSceneDepth, WorldPosition) * f_s;
+	#endif
+	}
+
+	// Transform NaNs to black, transform negative colors to black.
+	return -min(-Lighting, 0.0);
+}
+
+
+
+#if LIGHTING_VS
+
+int2 MaxViewportResolution;
+Texture2D<uint> HairVisibilityNodeCount;
+
+void MainVS(
+	in uint InVertexId : SV_VertexID,
+	out float4 OutPosition : SV_POSITION,
+	nointerpolation out uint OutNodeCount : DISPATCH_NODECOUNT,
+	nointerpolation out uint2 OutResolution : DISPATCH_RESOLUTION)
+{
+	OutNodeCount = HairVisibilityNodeCount.Load(uint3(0, 0, 0));
+	OutResolution.x = ceil(sqrt(OutNodeCount));
+	OutResolution.y = OutResolution.x;
+
+	const float2 ClipCoord = ((OutResolution + 0.5f) / float2(MaxViewportResolution)) * 2;
+
+	const float2 UV = float2(InVertexId & 1, InVertexId >> 1);
+	const float2 Pos = float2(-UV.x, UV.y) * 4 + float2(-1, +1) + float2(ClipCoord.x, -ClipCoord.y);
+	OutPosition = float4(Pos, 0.5f, 1);
+}
+
+#endif // LIGHTING_VS
+
+
+#if LIGHTING_PS
+
+uint MaxVisibilityNodeCount;
+StructuredBuffer<uint>	HairVisibilityNodeCoord;
+Buffer<uint4>			IndirectArgsBuffer;
+
+void MainPS(
+	float4 SVPos : SV_POSITION,
+	uint NodeCount : DISPATCH_NODECOUNT,
+	uint2 Resolution : DISPATCH_RESOLUTION,
+	out float4 OutColor : SV_Target0)
+{
+	OutColor = 0;
+
+	const uint2 InCoord = uint2(SVPos.xy);
+	const uint LocalOffset = InCoord.x + InCoord.y * Resolution.x;
+	if (LocalOffset >= NodeCount)
+	{
+		return;
+	}
+
+	const uint PackedCoord = HairVisibilityNodeCoord[LocalOffset];
+	const uint2 PixelCoord = uint2((PackedCoord & 0xFFFF), ((PackedCoord >> 16) & 0xFFFF));
+	const float2 SvPosition = PixelCoord + float2(0.5f, 0.5f);
+
+	const float2 UV = (PixelCoord + float2(0.5f, 0.5f)) / float2(View.BufferSizeAndInvSize.xy);
+	const float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+
+	if (LocalOffset > MaxVisibilityNodeCount)
+		return;
+
+	const FPackedTressFXSample PackedSample = HairVisibilityNodeData[LocalOffset];
+	const FTressFXSample Sample = UnpackTressFXSample(PackedSample);
+
+	FGBufferData GBuffer = (FGBufferData)0;
+	GBuffer.ShadingModelID = SHADINGMODELID_HAIR;
+	GBuffer.WorldNormal = Sample.Tangent;
+	GBuffer.BaseColor = Sample.BaseColor;
+	GBuffer.Roughness = Sample.Roughness;
+	GBuffer.Specular = Sample.Specular;
+	GBuffer.Metallic = 0; // Scattering;
+	GBuffer.Depth = ConvertFromDeviceZ(Sample.Depth);
+	GBuffer.GBufferAO = 1;
+	GBuffer.CustomData = float4(HairDualScatteringRoughnessOverride, 0, Sample.Backlit, 0);
+	GBuffer.IndirectIrradiance = 1000000;
+
+	const bool bDebugEnabled = false;
+
+
+	{
+		const float3 SkyLighting =
+			ReflectionEnvironmentSH(GBuffer, ScreenPosition, SvPosition, Sample.PrimitiveId, Sample.MacroGroupId, bDebugEnabled);
+
+		float SampleCoverage = saturate(From8bitCoverageTFX(Sample.Coverage8bit));
+
+		FLightAccumulator LightAccumulator = (FLightAccumulator)0;
+		LightAccumulator_Add(LightAccumulator, SkyLighting, SkyLighting, 1.0f, false);
+		OutColor.xyz = LightAccumulator_GetResult(LightAccumulator).xyz * SampleCoverage;
+		OutColor.a = SampleCoverage;
+	}
+
+}
+
+#endif // LIGHTING_PS
